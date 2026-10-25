@@ -712,6 +712,9 @@ document.addEventListener('drop', (e) => {
   if (f) openFile(f);
 });
 
+// Altes Sprachmodell der ersten Version (ca. 80 MB) vom Gerät entfernen
+globalThis.caches?.delete('transformers-cache').catch(() => {});
+
 if ('serviceWorker' in navigator && location.protocol === 'https:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
