@@ -1,11 +1,11 @@
-// Steuerung der App: Dokument laden, Befehle ausführen, Treffer verwalten, Schwärzen, Speichern.
+// Ablauf der App: PDF öffnen → automatisch prüfen → pro Fund entscheiden → anwenden → vergleichen → speichern.
 
 import * as pdfjsLib from '../vendor/pdfjs/pdf.min.mjs';
-import { parseCommand, findMatches, ruleLabel } from './detect.js';
-import { buildPageModel, quadsForRange } from './pdfmodel.js';
+import { scanDocument, parseCommand, findMatches, valueKey, normalize, SHORT } from './detect.js';
+import { buildPageModel, segmentsForRange, findImages } from './pdfmodel.js';
 import { redactPdf, verifyResult } from './redact.js';
-import { Viewer } from './viewer.js';
-import { LocalSpeech } from './speech.js';
+import { PageViewer } from './viewer.js';
+import { PseudonymTable, Pseudonymizer } from './pseudo.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('../vendor/pdfjs/pdf.worker.min.mjs', import.meta.url).href;
 const PDF_OPTS = {
@@ -19,51 +19,72 @@ const PDF_OPTS = {
 const $ = (id) => document.getElementById(id);
 const ui = {
   open: $('btnOpen'), open2: $('btnOpen2'), fileInput: $('fileInput'), fileName: $('fileName'),
-  viewBar: $('viewBar'), tabOriginal: $('tabOriginal'), tabResult: $('tabResult'), mark: $('btnMark'),
-  empty: $('empty'), viewOriginal: $('viewOriginal'), viewResult: $('viewResult'),
-  sheet: $('sheet'), status: $('status'), mic: $('btnMic'), form: $('cmdForm'), input: $('cmdInput'),
-  rules: $('rules'), undo: $('btnUndo'), apply: $('btnApply'),
-  saveBar: $('saveBar'), verify: $('verify'), saveName: $('saveName'), save: $('btnSave'),
-  settings: $('settings'), btnSettings: $('btnSettings'), setModel: $('setModel'), setDpi: $('setDpi'),
-  setRasterAll: $('setRasterAll'), clearModel: $('btnClearModel'), toast: $('toast'),
+  empty: $('empty'), viewer: $('viewer'), toolbar: $('toolbar'), spacer: $('spacer'),
+  zoom: $('btnZoom'), mark: $('btnMark'), tabOriginal: $('tabOriginal'), tabResult: $('tabResult'), pageInfo: $('pageInfo'),
+  sheet: $('sheet'), sheetHead: $('sheetHead'), summary: $('summary'), primary: $('btnPrimary'), scrim: $('scrim'),
+  body: $('sheetBody'), verify: $('verify'), hintForm: $('hintForm'), hintInput: $('hintInput'),
+  filters: $('filters'), bulk: $('bulk'), list: $('findings'),
+  saveDlg: $('saveDlg'), saveName: $('saveName'), saveHint: $('saveHint'),
+  settings: $('settings'), btnSettings: $('btnSettings'), setDefault: $('setDefault'), setLow: $('setLow'),
+  setDpi: $('setDpi'), setRasterAll: $('setRasterAll'), tableBox: $('tableBox'),
+  btnExport: $('btnExport'), btnImport: $('btnImport'), btnClearTable: $('btnClearTable'), importInput: $('importInput'),
+  toast: $('toast'),
 };
 
 // ---------------------------------------------------------------------------
-// Zustand
+// Zustand und Einstellungen
 // ---------------------------------------------------------------------------
 
 const state = {
   file: null, // { name, bytes, handle }
-  doc: null, // pdf.js-Dokument (Original)
-  models: [], // Textmodelle je Seite
-  rules: [], // Regeln mit Treffern
-  manual: null, // Regel für manuell markierte Bereiche
-  history: [], // für „Rückgängig“: Regel-IDs bzw. {manual: id}
-  result: null, // { bytes, doc, report }
+  doc: null,
+  models: [],
+  findings: [],
+  notices: [],
+  result: null, // { bytes, doc, report, stats }
   stale: false,
   view: 'original',
+  filter: 'alle',
   busy: false,
 };
 
-const settings = loadSettings();
-function loadSettings() {
-  const def = { model: 'Xenova/whisper-base', dpi: 200, rasterAll: false };
-  try { return { ...def, ...JSON.parse(localStorage.getItem('pdfredact.settings') || '{}') }; } catch { return def; }
-}
+const SETTINGS_KEY = 'pdfprivacy.settings';
+const settings = (() => {
+  const def = { defaultAction: 'redact', preselectLow: false, dpi: 200, rasterAll: false };
+  try { return { ...def, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') }; } catch { return def; }
+})();
 function storeSettings() {
-  try { localStorage.setItem('pdfredact.settings', JSON.stringify(settings)); } catch { /* privater Modus */ }
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch { /* privater Modus */ }
 }
 
-const viewerOriginal = new Viewer(ui.viewOriginal, { onDraw: addManualBox });
-const viewerResult = new Viewer(ui.viewResult);
+const table = new PseudonymTable();
+let pseudo = new Pseudonymizer(table);
+
+const viewer = new PageViewer(ui.viewer, {
+  onChange: renderToolbar,
+  onTapShape: (id) => { const f = findingByShape(id); if (f) focusFinding(f); },
+  onDraw: addManualArea,
+});
+
+let seq = 0;
+const nextId = () => `f${++seq}`;
 
 // ---------------------------------------------------------------------------
-// Statusanzeige
+// Kleine Helfer
 // ---------------------------------------------------------------------------
 
-function setStatus(text, kind = '') {
-  ui.status.textContent = text;
-  ui.status.className = `status ${kind}`;
+function el(tag, props = {}, ...children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (v === undefined || v === null || v === false) continue;
+    if (k === 'class') e.className = v;
+    else if (k === 'dataset') Object.assign(e.dataset, v);
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+    else if (k in e) e[k] = v;
+    else e.setAttribute(k, v);
+  }
+  e.append(...children.flat().filter((c) => c !== null && c !== undefined && c !== false));
+  return e;
 }
 
 let toastTimer;
@@ -74,13 +95,23 @@ function toast(text, ms = 3200) {
   toastTimer = setTimeout(() => (ui.toast.hidden = true), ms);
 }
 
+function busy(text) {
+  ui.summary.replaceChildren(el('span', { class: 'busy-line' }, text));
+}
+
+function reportError(e, msg = 'Fehler') {
+  console.error(e);
+  toast(`${msg}${e?.message ? ` (${e.message})` : ''}`, 6000);
+}
+
+const isDesktop = () => matchMedia('(min-width: 900px)').matches;
+
 // ---------------------------------------------------------------------------
-// Dokument öffnen
+// Dokument öffnen und automatisch prüfen
 // ---------------------------------------------------------------------------
 
 async function pickFile() {
   if (window.showOpenFilePicker) {
-    // Desktop-Chrome/Edge: Dateizugriff behalten, damit „Speichern“ die Datei direkt überschreiben kann
     try {
       const [handle] = await window.showOpenFilePicker({ types: [{ description: 'PDF', accept: { 'application/pdf': ['.pdf'] } }] });
       await openFile(await handle.getFile(), handle);
@@ -95,7 +126,6 @@ async function pickFile() {
 
 async function openFile(file, handle = null) {
   try {
-    setStatus('Dokument wird geöffnet …', 'busy');
     const bytes = new Uint8Array(await file.arrayBuffer());
     const task = pdfjsLib.getDocument({ ...PDF_OPTS, data: bytes.slice() });
     task.onPassword = (cb, reason) => {
@@ -104,311 +134,420 @@ async function openFile(file, handle = null) {
     };
     const doc = await task.promise;
 
-    await resetAll(false);
-    state.doc?.destroy();
-    state.file = { name: file.name || 'dokument.pdf', bytes, handle };
-    state.doc = doc;
+    await clearResult();
+    await state.doc?.destroy();
+    Object.assign(state, { file: { name: file.name || 'dokument.pdf', bytes, handle }, doc, models: [], findings: [], notices: [], filter: 'alle' });
+    pseudo = new Pseudonymizer(table);
     ui.fileName.textContent = state.file.name;
-    ui.saveName.value = state.file.name;
     ui.empty.hidden = true;
-    ui.viewBar.hidden = false;
-    ui.sheet.hidden = false;
-    showView('original');
-    await viewerOriginal.setDocument(doc);
+    for (const x of [ui.viewer, ui.toolbar, ui.sheet, ui.spacer]) x.hidden = false;
+    setView('original');
+    await viewer.setDocument(doc);
 
-    state.models = [];
     for (let i = 1; i <= doc.numPages; i++) {
-      setStatus(`Text wird gelesen … Seite ${i}/${doc.numPages}`, 'busy');
+      busy(`Lese Seite ${i} von ${doc.numPages} …`);
       state.models.push(await buildPageModel(await doc.getPage(i)));
     }
-    const chars = state.models.reduce((n, m) => n + m.text.trim().length, 0);
-    if (!chars) {
-      setStatus('Keine Textebene gefunden (eingescanntes Dokument?). Markiere die Bereiche von Hand mit „Bereich markieren“.', 'error');
-    } else {
-      setStatus(`${doc.numPages} Seite${doc.numPages > 1 ? 'n' : ''} geladen. Tippe aufs Mikrofon und sag, was entfernt werden soll.`);
-    }
-    updateButtons();
+    busy('Suche nach kritischen Daten …');
+    await analyze();
   } catch (e) {
     reportError(e, 'Das PDF konnte nicht geöffnet werden.');
   }
 }
 
+function texts() {
+  return state.models.map((m) => m.text);
+}
+
+function defaultAction(f) {
+  if (f.cat === 'image') return 'keep';
+  if (f.known) return 'replace';
+  if (f.risk === 'niedrig' && !settings.preselectLow) return 'keep';
+  return settings.defaultAction;
+}
+
+/** Fund aus Textstellen aufbauen (inkl. Flächen zum Markieren). */
+function makeFinding(base) {
+  const f = { id: nextId(), variants: [], ...base };
+  for (const o of f.occurrences) {
+    if (!o.segments) o.segments = segmentsForRange(state.models[o.page], o.start, o.end);
+    o.quads = o.segments.map((s) => s.quad);
+  }
+  return f;
+}
+
+async function analyze() {
+  const found = scanDocument(texts()).map((g) => makeFinding(g));
+
+  // Bilder: mögliche Unterschriften, Fotos, Stempel; ganzseitige Bilder = Scan
+  for (let i = 0; i < state.doc.numPages; i++) {
+    const page = await state.doc.getPage(i + 1);
+    const imgs = await findImages(page, pdfjsLib.OPS).catch(() => []);
+    const textLen = state.models[i].text.trim().length;
+    for (const img of imgs) {
+      if (img.share > 0.6) {
+        if (textLen < 40) state.notices.push(`Seite ${i + 1} ist ein Scan (Bild ohne Text). Inhalte darauf kann die App nicht lesen – bitte selbst prüfen und mit ▭ markieren.`);
+        continue;
+      }
+      found.push(makeFinding({
+        cat: 'image', label: 'Bild', risk: 'niedrig',
+        value: `Bild auf Seite ${i + 1} (${Math.max(1, Math.round(img.share * 100))} % der Seite)`,
+        note: 'Unterschrift, Foto, Stempel oder Logo? Bitte ansehen.',
+        occurrences: [{ page: i, segments: [{ quad: img.quad }], text: '' }],
+      }));
+    }
+  }
+  if (!state.models.some((m) => m.text.trim()) && !state.notices.length) {
+    state.notices.push('Dieses PDF enthält keinen lesbaren Text (eingescannt?). Bitte Bereiche mit ▭ von Hand markieren.');
+  }
+
+  for (const f of found) {
+    await pseudo.prepare(f);
+    f.action = defaultAction(f);
+  }
+  state.findings = found;
+  changed();
+  if (!isDesktop() && found.length) openSheet(true);
+}
+
 // ---------------------------------------------------------------------------
-// Regeln und Treffer
+// Funde ändern
 // ---------------------------------------------------------------------------
 
-let matchSeq = 0;
-function computeMatches(rule) {
-  const texts = state.models.map((m) => m.text);
-  rule.matches = findMatches(rule, texts).map((m) => ({
-    ...m,
-    id: `m${++matchSeq}`,
-    selected: true,
-    quads: quadsForRange(state.models[m.page], m.start, m.end),
-  }));
+function setAction(f, action) {
+  if (action === 'replace' && !f.fake) return toast('Für diesen Fund gibt es keinen Ersatzwert – bitte schwärzen.');
+  f.action = action;
+  changed();
 }
 
-function addRules(rules, source) {
-  const summary = [];
-  for (const rule of rules) {
-    rule.source = source;
-    computeMatches(rule);
-    state.rules.push(rule);
-    state.history.push(rule.id);
-    summary.push(`${ruleLabel(rule)}: ${rule.matches.length || 'keine'} Treffer`);
+async function addManualArea(page, quad) {
+  const n = state.findings.filter((f) => f.cat === 'manual').length + 1;
+  const f = makeFinding({
+    cat: 'manual', label: 'Markierter Bereich', risk: 'hoch', value: `Bereich ${n} auf Seite ${page + 1}`,
+    occurrences: [{ page, segments: [{ quad }], text: '' }],
+  });
+  f.action = 'redact';
+  state.findings.unshift(f);
+  changed();
+  toast('Bereich wird geschwärzt. Weitere Bereiche ziehen oder ▭ beenden.');
+}
+
+/** Hinweise des Nutzers: zusätzliche Begriffe/Kategorien oder „behalte …“. */
+async function applyHint(text) {
+  text = text.trim();
+  if (!text || !state.doc) return;
+  const keepMatch = text.match(/^(?:bitte\s+)?(?:behalte|behalten|nicht schwärzen|nicht ändern|ignoriere|ignorieren|lass|lasse)\s+(.+)$/i);
+  const cmd = parseCommand(keepMatch ? keepMatch[1] : text);
+  if (cmd.action === 'apply') return primaryAction();
+  if (cmd.action === 'save') { if (cmd.saveName) ui.saveName.value = cmd.saveName; return primaryAction(); }
+  if (cmd.action !== 'add') return toast(`Nicht verstanden: „${text}“`);
+
+  let added = 0, changedCount = 0;
+  for (const rule of cmd.rules) {
+    const hits = findMatches(rule, texts());
+    if (keepMatch) {
+      for (const f of state.findings) {
+        const hit = rule.kind === 'category' ? f.cat === rule.cat
+          : normalize(f.value).includes(normalize(rule.term)) || hits.some((h) => f.occurrences.some((o) => o.page === h.page && o.start < h.end && h.start < o.end));
+        if (hit && f.action !== 'keep') { f.action = 'keep'; changedCount++; }
+      }
+      continue;
+    }
+    const fresh = [];
+    for (const h of hits) {
+      const owner = state.findings.find((f) => f.occurrences.some((o) => o.page === h.page && o.start < h.end && h.start < o.end));
+      if (owner) {
+        if (owner.action === 'keep') { owner.action = owner.fake && settings.defaultAction === 'replace' ? 'replace' : 'redact'; changedCount++; }
+      } else fresh.push(h);
+    }
+    // Neue Treffer nach Wert zusammenfassen
+    const groups = new Map();
+    for (const h of fresh) {
+      const cat = rule.kind === 'category' ? rule.cat : 'hint';
+      const key = valueKey(cat, h.text);
+      if (!groups.has(key)) groups.set(key, { cat, label: rule.kind === 'category' ? SHORT[cat] : 'Dein Hinweis', risk: 'hoch', occurrences: [] });
+      groups.get(key).occurrences.push({ page: h.page, start: h.start, end: h.end, text: h.text });
+    }
+    for (const g of groups.values()) {
+      const vals = [...new Set(g.occurrences.map((o) => o.text.replace(/\s+/g, ' ').trim()))];
+      g.value = vals.reduce((a, b) => (b.length > a.length ? b : a));
+      g.variants = vals.filter((v) => v !== g.value);
+      const f = makeFinding(g);
+      await pseudo.prepare(f);
+      f.action = f.known ? 'replace' : settings.defaultAction === 'replace' && f.fake ? 'replace' : 'redact';
+      state.findings.unshift(f);
+      added++;
+    }
   }
+  ui.hintInput.value = '';
+  state.filter = 'alle';
   changed();
-  setStatus(summary.join(' · '));
-  const first = rules.flatMap((r) => r.matches)[0];
-  if (first) viewerOriginal.scrollToShape(first.page, first.quads[0]);
+  if (added || changedCount) toast(keepMatch ? `${changedCount} Fund(e) bleiben unverändert.` : `${added} neue Fund(e)${changedCount ? `, ${changedCount} geändert` : ''}.`);
+  else toast('Dazu wurde im Dokument nichts gefunden.');
+  if (added) ui.list.firstElementChild?.scrollIntoView({ block: 'nearest' });
 }
 
-function addManualBox(page, quad) {
-  if (!state.manual) {
-    state.manual = { id: 'manual', kind: 'manual', matches: [] };
-  }
-  const m = { id: `m${++matchSeq}`, page, quads: [quad], text: '', selected: true, manual: true };
-  state.manual.matches.push(m);
-  state.history.push({ manual: m.id });
-  changed();
-  setStatus(`Bereich auf Seite ${page + 1} markiert.`);
+// ---------------------------------------------------------------------------
+// Anzeige: Zusammenfassung, Liste, Markierungen
+// ---------------------------------------------------------------------------
+
+function counts() {
+  const c = { redact: 0, replace: 0, keep: 0 };
+  for (const f of state.findings) c[f.action]++;
+  return c;
 }
 
-function allRules() {
-  return state.manual?.matches.length ? [...state.rules, state.manual] : state.rules;
-}
-
-function selectedMatches() {
-  return allRules().flatMap((r) => r.matches.filter((m) => m.selected));
-}
-
-function undo() {
-  const last = state.history.pop();
-  if (!last) return toast('Nichts zum Rückgängigmachen.');
-  if (last.manual) {
-    state.manual.matches = state.manual.matches.filter((m) => m.id !== last.manual);
-    setStatus('Letzte Markierung entfernt.');
-  } else {
-    const rule = state.rules.find((r) => r.id === last);
-    state.rules = state.rules.filter((r) => r.id !== last);
-    setStatus(`Rückgängig: ${rule ? ruleLabel(rule) : 'Regel'}`);
-  }
-  changed();
-}
-
-function removeRule(id) {
-  if (id === 'manual') { state.manual = null; state.history = state.history.filter((h) => !h.manual); }
-  else { state.rules = state.rules.filter((r) => r.id !== id); state.history = state.history.filter((h) => h !== id); }
-  changed();
-}
-
-async function resetAll(announce = true) {
-  state.rules = [];
-  state.manual = null;
-  state.history = [];
-  await clearResult();
-  if (state.doc) changed();
-  if (announce) setStatus('Alle Regeln und Markierungen verworfen.');
-}
-
-async function clearResult() {
-  viewerResult.clear();
-  await state.result?.doc?.destroy();
-  state.result = null;
-  state.stale = false;
-  ui.saveBar.hidden = true;
-  ui.tabResult.disabled = true;
-  ui.tabResult.classList.remove('stale');
-  if (state.view === 'result') showView('original');
-}
-
-/** Nach jeder Änderung: Liste, Markierungen und Knöpfe aktualisieren. */
 function changed() {
   if (state.result) {
     state.stale = true;
     ui.tabResult.classList.add('stale');
-    ui.verify.innerHTML = '<span class="warn">Die Auswahl hat sich geändert – bitte erneut „Schwärzen“.</span>';
   }
-  renderRules();
+  renderSummary();
+  renderList();
   renderOverlays();
-  updateButtons();
 }
 
-function updateButtons() {
-  ui.undo.disabled = !state.history.length;
-  ui.apply.disabled = !state.doc || state.busy || !selectedMatches().length;
-  ui.save.disabled = !state.result || state.stale || state.busy;
+function renderSummary() {
+  const c = counts();
+  const n = state.findings.length;
+  ui.summary.replaceChildren();
+  if (state.result && !state.stale) {
+    const ok = state.result.report.ok;
+    ui.summary.append(el('span', { class: ok ? 'ok' : 'bad' }, ok ? '✓ Fertig und geprüft' : '✗ Bitte Prüfbericht ansehen'));
+  } else {
+    ui.summary.append(el('b', {}, n ? `${n} Fund${n === 1 ? '' : 'e'}` : 'Keine Funde'));
+  }
+  if (c.redact) ui.summary.append(el('span', { class: 'pill redact' }, `■ ${c.redact} schwärzen`));
+  if (c.replace) ui.summary.append(el('span', { class: 'pill replace' }, `⇄ ${c.replace} ersetzen`));
+  if (c.keep) ui.summary.append(el('span', { class: 'pill' }, `${c.keep} behalten`));
+
+  const done = state.result && !state.stale;
+  ui.primary.textContent = done ? 'Speichern' : state.result ? 'Änderungen anwenden' : 'Anwenden';
+  ui.primary.disabled = state.busy || (!done && !c.redact && !c.replace);
+}
+
+const RISK_ORDER = ['hoch', 'mittel', 'niedrig'];
+
+function renderList() {
+  // Filter
+  const by = (r) => state.findings.filter((f) => f.risk === r).length;
+  ui.filters.replaceChildren(
+    ...[['alle', `Alle ${state.findings.length}`], ...RISK_ORDER.map((r) => [r, `${r[0].toUpperCase() + r.slice(1)} ${by(r)}`])]
+      .filter(([k]) => k === 'alle' || by(k))
+      .map(([k, label]) => el('button', {
+        type: 'button', class: state.filter === k ? 'on' : '',
+        onclick: () => { state.filter = k; renderList(); },
+      }, k !== 'alle' ? el('span', { class: 'dot', style: `background: var(--${k === 'hoch' ? 'high' : k === 'mittel' ? 'mid' : 'low'})` }) : null, label)),
+  );
+  ui.bulk.hidden = state.findings.length < 2;
+
+  const visible = state.findings.filter((f) => state.filter === 'alle' || f.risk === state.filter);
+  ui.list.replaceChildren(
+    ...state.notices.map((t) => el('li', { class: 'notice' }, '⚠︎ ', t)),
+    ...visible.map(renderFinding),
+  );
+  if (!state.findings.length && state.doc) {
+    ui.list.append(el('li', { class: 'nothing' }, 'Keine kritischen Daten erkannt. Ergänze per Hinweis oder markiere Bereiche mit ▭.'));
+  }
+}
+
+function renderFinding(f) {
+  const where = [...new Set(f.occurrences.map((o) => o.page + 1))];
+  const times = f.occurrences.length;
+  const canReplace = !!f.fake;
+  const actions = [['redact', 'Schwärzen'], ...(canReplace ? [['replace', 'Ersetzen']] : []), ['keep', f.cat === 'manual' ? 'Entfernen' : 'Behalten']];
+  return el('li', { class: `finding r-${f.risk}`, dataset: { id: f.id } },
+    el('div', { class: 'meta' },
+      el('span', { class: 'risk' }, f.risk),
+      el('span', {}, f.label),
+      el('span', { class: 'where' }, `S. ${where.join(', ')}${times > 1 ? ` · ${times}×` : ''}`),
+    ),
+    el('button', {
+      type: 'button', class: `value${/\d/.test(f.value) && f.occurrences[0].text ? '' : ' text'}`, title: 'Im Dokument zeigen',
+      onclick: () => showInDocument(f),
+    }, f.value),
+    f.variants.length ? el('div', { class: 'variants' }, `auch: ${f.variants.join(' · ')}`) : null,
+    f.note ? el('div', { class: 'note' }, f.note) : null,
+    el('div', { class: `choice${actions.length === 2 ? ' two' : ''}` },
+      actions.map(([a, label]) => el('button', {
+        type: 'button', class: f.action === a ? 'on' : '', dataset: { a },
+        onclick: () => (f.cat === 'manual' && a === 'keep' ? removeFinding(f) : setAction(f, a)),
+      }, label)),
+    ),
+    f.action === 'replace' ? el('div', { class: 'fake' },
+      el('span', { class: 'arrow' }, '→'),
+      el('code', {}, f.fake),
+      f.known ? el('span', { class: 'known', title: 'Aus deiner Pseudonym-Tabelle' }, 'bekannt') : null,
+      el('button', { type: 'button', class: 'dice', 'aria-label': 'Anderen Ersatzwert erzeugen', onclick: () => { pseudo.regenerate(f); refreshNameFakes(); changed(); } }, '🎲'),
+    ) : null,
+  );
+}
+
+/** Nach dem Neu-Würfeln eines Namens die anderen Namen (gleiche Bestandteile) aktualisieren. */
+function refreshNameFakes() {
+  for (const f of state.findings) if (pseudo.kindOf(f) === 'name') f.fake = pseudo.nameReplace(f.value);
+}
+
+function removeFinding(f) {
+  state.findings = state.findings.filter((x) => x !== f);
+  changed();
 }
 
 function renderOverlays() {
   const shapes = [];
-  for (const r of allRules()) {
-    for (const m of r.matches) {
-      const cls = m.manual ? 'manual' : `hit${m.fuzzy ? ' fuzzy' : ''}${m.selected ? '' : ' off'}`;
-      for (const q of m.quads) shapes.push({ page: m.page, quad: q, cls, id: m.id });
+  if (state.view === 'original') {
+    for (const f of state.findings) {
+      for (const o of f.occurrences) for (const quad of o.quads) shapes.push({ page: o.page, quad, cls: `hit ${f.action}`, id: f.id });
     }
   }
-  viewerOriginal.setOverlays(shapes);
+  viewer.setOverlays(shapes);
 }
 
-function findMatch(id) {
-  for (const r of allRules()) for (const m of r.matches) if (m.id === id) return m;
-  return null;
+function findingByShape(id) {
+  return state.findings.find((f) => f.id === id);
 }
 
-function el(tag, props = {}, ...children) {
-  const e = document.createElement(tag);
-  for (const [k, v] of Object.entries(props)) {
-    if (k === 'class') e.className = v;
-    else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
-    else if (k in e) e[k] = v;
-    else e.setAttribute(k, v);
-  }
-  e.append(...children.filter((c) => c !== null && c !== undefined));
-  return e;
+function focusFinding(f) {
+  if (state.filter !== 'alle' && state.filter !== f.risk) { state.filter = 'alle'; renderList(); }
+  openSheet(true);
+  const li = ui.list.querySelector(`[data-id="${f.id}"]`);
+  if (!li) return;
+  li.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  li.classList.add('focus');
+  setTimeout(() => li.classList.remove('focus'), 1800);
 }
 
-const openRules = new Set(); // aufgeklappte Regeln merken
-
-function renderRules() {
-  ui.rules.replaceChildren();
-  for (const r of allRules()) {
-    const sel = r.matches.filter((m) => m.selected).length;
-    const all = el('input', {
-      type: 'checkbox', checked: sel > 0 && sel === r.matches.length, disabled: !r.matches.length,
-      'aria-label': 'Alle an/aus',
-      onchange: (e) => { r.matches.forEach((m) => (m.selected = e.target.checked)); changed(); },
-    });
-    all.indeterminate = sel > 0 && sel < r.matches.length;
-    all.addEventListener('click', (e) => e.stopPropagation());
-    const head = el('summary', { class: 'rule-head' },
-      all,
-      el('span', { class: 'title' }, r.kind === 'manual' ? 'Manuell markierte Bereiche' : ruleLabel(r)),
-      el('span', { class: `count${r.matches.length ? '' : ' none'}` }, r.matches.length ? `${sel}/${r.matches.length}` : 'keine Treffer'),
-      el('button', { type: 'button', 'aria-label': 'Regel entfernen', onclick: (e) => { e.preventDefault(); removeRule(r.id); } }, '✕'),
-    );
-    const box = el('details', { class: 'rule', open: openRules.has(r.id) || !r.matches.length }, head);
-    box.addEventListener('toggle', () => (box.open ? openRules.add(r.id) : openRules.delete(r.id)));
-    if (!r.matches.length) {
-      box.append(el('div', { class: 'empty-hint' }, r.kind === 'term'
-        ? 'Nicht gefunden. Versuch eine andere Schreibweise, tippe den Begriff ein oder markiere die Stelle von Hand.'
-        : 'Im Dokument nicht gefunden.'));
-    } else {
-      const ul = el('ul');
-      for (const m of r.matches) {
-        ul.append(el('li', {},
-          el('label', {},
-            el('input', { type: 'checkbox', checked: m.selected, onchange: (e) => { m.selected = e.target.checked; changed(); } }),
-            el('span', { class: 't' }, m.manual ? 'Fläche' : m.text.replace(/\s+/g, ' ')),
-            m.note ? el('span', { class: 'note' }, m.note) : null,
-          ),
-          el('span', { class: 'pg' }, `S. ${m.page + 1}`),
-          el('button', { type: 'button', onclick: () => { showView('original'); viewerOriginal.scrollToShape(m.page, m.quads[0]); } }, 'zeigen'),
-        ));
-      }
-      box.append(ul);
-    }
-    ui.rules.append(box);
-  }
+let revealIndex = new Map();
+function showInDocument(f) {
+  // Mehrfaches Tippen springt reihum durch alle Vorkommen
+  const i = ((revealIndex.get(f.id) ?? -1) + 1) % f.occurrences.length;
+  revealIndex.set(f.id, i);
+  const o = f.occurrences[i];
+  if (state.view !== 'original') setView('original');
+  openSheet(false);
+  viewer.reveal(o.page, o.quads[0], f.id);
+  if (f.occurrences.length > 1) toast(`Vorkommen ${i + 1} von ${f.occurrences.length} – erneut tippen für das nächste.`, 2200);
 }
 
-// Tippen auf eine Markierung im Dokument schaltet den Treffer an/aus
-ui.viewOriginal.addEventListener('click', (e) => {
-  const id = e.target?.dataset?.id;
-  if (!id || viewerOriginal.markMode) return;
-  const m = findMatch(id);
-  if (!m) return;
-  if (m.manual) {
-    state.manual.matches = state.manual.matches.filter((x) => x !== m);
-    toast('Markierung entfernt.');
-  } else {
-    m.selected = !m.selected;
-    toast(m.selected ? `„${m.text}“ wird geschwärzt` : `„${m.text}“ bleibt stehen`);
-  }
-  changed();
-});
-
-// ---------------------------------------------------------------------------
-// Befehle
-// ---------------------------------------------------------------------------
-
-async function runCommand(text) {
-  text = text.trim();
-  if (!text) return;
-  if (!state.doc) return toast('Bitte zuerst ein PDF öffnen.');
-  const cmd = parseCommand(text);
-  switch (cmd.action) {
-    case 'add': addRules(cmd.rules, text); break;
-    case 'apply': await applyRedaction(); break;
-    case 'undo': undo(); break;
-    case 'reset': await resetAll(); break;
-    case 'showResult': state.result ? showView('result') : toast('Noch kein Ergebnis – sag „Schwärzen“.'); break;
-    case 'showOriginal': showView('original'); break;
-    case 'save':
-      if (cmd.saveName) ui.saveName.value = cmd.saveName;
-      if (!state.result || state.stale) await applyRedaction();
-      if (state.result) await save(false);
-      break;
-    default: setStatus(`Nicht verstanden: „${text}“`, 'error');
-  }
-  ui.input.value = '';
+function renderToolbar({ index, count, zoom, q }) {
+  ui.pageInfo.textContent = count ? `Seite ${index + 1}/${count}` : '';
+  ui.zoom.setAttribute('aria-pressed', String(zoom));
+  ui.zoom.querySelectorAll('.qmap i').forEach((c, i) => c.classList.toggle('on', i === q));
 }
 
 // ---------------------------------------------------------------------------
-// Schwärzen
+// Blatt (Liste) auf-/zuklappen
 // ---------------------------------------------------------------------------
 
-async function applyRedaction() {
-  const sel = selectedMatches();
-  if (!sel.length) return toast('Es ist nichts zum Schwärzen ausgewählt.');
+function openSheet(open) {
+  if (isDesktop()) return;
+  ui.sheet.classList.toggle('open', open);
+  ui.scrim.hidden = !open;
+  ui.sheetHead.setAttribute('aria-expanded', String(open));
+  if (open) ui.body.scrollTop = ui.body.scrollTop; // iOS: Scrollposition behalten
+}
+
+// ---------------------------------------------------------------------------
+// Anwenden
+// ---------------------------------------------------------------------------
+
+async function primaryAction() {
+  if (state.result && !state.stale) return openSave();
+  await applyAll();
+}
+
+async function applyAll() {
+  const active = state.findings.filter((f) => f.action !== 'keep');
+  if (!active.length) return toast('Es ist nichts zum Schwärzen oder Ersetzen ausgewählt.');
   state.busy = true;
-  updateButtons();
+  renderSummary();
   try {
     const redactions = new Map();
-    for (const m of sel) {
-      if (!redactions.has(m.page)) redactions.set(m.page, { quads: [], excluded: new Set(), blockQuads: [] });
-      const r = redactions.get(m.page);
-      r.quads.push(...m.quads);
-      if (m.manual) r.blockQuads.push(...m.quads);
-      else for (let i = m.start; i < m.end; i++) r.excluded.add(i);
+    const get = (p) => {
+      if (!redactions.has(p)) redactions.set(p, { quads: [], replacements: [], excluded: new Set(), blockQuads: [] });
+      return redactions.get(p);
+    };
+    for (const f of active) {
+      for (const o of f.occurrences) {
+        const r = get(o.page);
+        const area = f.cat === 'manual' || f.cat === 'image';
+        if (area) { r.blockQuads.push(...o.quads); continue; }
+        for (let i = o.start; i < o.end; i++) r.excluded.add(i);
+        const replaceable = f.action === 'replace' && o.segments.some((s) => s.geom);
+        if (replaceable) r.replacements.push({ segments: o.segments, text: pseudo.fakeFor(f, o.text) });
+        else r.quads.push(...o.quads);
+      }
     }
     const { bytes, stats } = await redactPdf({
       bytes: state.file.bytes, pdfDoc: state.doc, redactions, models: state.models,
       rasterAll: settings.rasterAll, dpi: settings.dpi,
-      onProgress: (i, n) => setStatus(`Schwärze … Seite ${i}/${n}`, 'busy'),
+      onProgress: (i, n) => busy(`Bearbeite Seite ${i} von ${n} …`),
     });
 
-    setStatus('Prüfe das Ergebnis …', 'busy');
-    const removedTexts = sel.filter((m) => !m.manual).map((m) => m.text);
-    const keptTexts = allRules().flatMap((r) => r.matches.filter((m) => !m.selected && !m.manual).map((m) => m.text));
-    const report = await verifyResult({ pdfjsLib, bytes, rules: state.rules, removedTexts, keptTexts });
+    busy('Prüfe das Ergebnis …');
+    const removedTexts = active.flatMap((f) => f.occurrences.map((o) => o.text)).filter(Boolean);
+    const keptTexts = state.findings.filter((f) => f.action === 'keep').flatMap((f) => f.occurrences.map((o) => o.text))
+      .concat(active.filter((f) => f.action === 'replace').map((f) => f.fake || ''));
+    const report = await verifyResult({ pdfjsLib, bytes, rules: [], removedTexts, keptTexts });
+
+    await pseudo.commit(active);
+    navigator.storage?.persist?.().catch(() => {});
 
     await clearResult();
     const doc = await pdfjsLib.getDocument({ ...PDF_OPTS, data: bytes.slice() }).promise;
     state.result = { bytes, doc, report, stats };
-    await viewerResult.setDocument(doc);
+    state.stale = false;
     ui.tabResult.disabled = false;
-    ui.saveBar.hidden = false;
-    renderReport(report, stats, sel.length);
-    showView('result');
-    setStatus(report.ok ? 'Fertig. Vergleiche Original und Ergebnis, dann speichern.' : 'Fertig – bitte Prüfhinweise beachten.', report.ok ? '' : 'error');
+    ui.tabResult.classList.remove('stale');
+    renderReport();
+    await setView('result');
+    openSheet(false);
+    toast(report.ok ? 'Fertig. Mit „Vorher/Nachher“ vergleichen, dann speichern.' : 'Achtung: Bitte den Prüfbericht ansehen.', 4000);
   } catch (e) {
-    reportError(e, 'Schwärzen fehlgeschlagen.');
+    reportError(e, 'Bearbeitung fehlgeschlagen.');
   } finally {
     state.busy = false;
-    updateButtons();
+    renderSummary();
   }
 }
 
-function renderReport(report, stats, count) {
+function renderReport() {
+  const { report, stats } = state.result;
+  ui.verify.hidden = false;
   ui.verify.replaceChildren();
   const line = (cls, text) => ui.verify.append(el('div', { class: cls }, text));
-  if (report.ok) line('ok', `✓ ${count} Stelle${count > 1 ? 'n' : ''} entfernt – im Ergebnis-PDF nicht mehr auffindbar (Text, Datenströme, Metadaten).`);
+  const parts = [stats.boxes ? `${stats.boxes} Stelle(n) geschwärzt` : '', stats.replaced ? `${stats.replaced} ersetzt` : ''].filter(Boolean).join(', ');
+  if (report.ok) line('ok', `✓ ${parts}. Die Originale sind im neuen PDF nicht mehr auffindbar – weder im Text noch in Datenströmen oder Metadaten.`);
   else line('bad', '✗ Achtung: Im Ergebnis wurden noch Spuren gefunden!');
   if (report.leftInText.length) line('bad', `Noch im Text: ${report.leftInText.join(', ')}`);
   if (report.leftInRaw.length) line('bad', `Noch in PDF-Datenströmen: ${report.leftInRaw.join(', ')}`);
-  for (const h of report.ruleHits) line('warn', `Hinweis: ${ruleLabel(h.rule)} – ${h.count} nicht ausgewählte Stelle${h.count > 1 ? 'n' : ''} sind noch enthalten.`);
-  line('small', `${stats.rasterized} Seite(n) neu als Bild aufgebaut, ${stats.copied} unverändert übernommen. Metadaten, Kommentare, Formulare, Lesezeichen und Anhänge wurden entfernt.`);
+  line('small', `${stats.rasterized} Seite(n) neu aufgebaut, ${stats.copied} übernommen. Metadaten, Kommentare, Formulare, Lesezeichen und Anhänge wurden entfernt.`);
+}
+
+async function clearResult() {
+  await state.result?.doc?.destroy();
+  state.result = null;
+  state.stale = false;
+  ui.verify.hidden = true;
+  ui.tabResult.disabled = true;
+  ui.tabResult.classList.remove('stale');
+}
+
+async function setView(view) {
+  if (view === 'result' && !state.result) return;
+  state.view = view;
+  ui.tabOriginal.classList.toggle('active', view === 'original');
+  ui.tabResult.classList.toggle('active', view === 'result');
+  if (view === 'result') { setMarkMode(false); ui.mark.disabled = true; } else ui.mark.disabled = false;
+  renderOverlays();
+  // Gleiche Seite und gleiches Viertel im anderen Dokument zeigen – ideal zum Vergleichen
+  await viewer.setDocument(view === 'result' ? state.result.doc : state.doc, { keepPosition: true });
+}
+
+function setMarkMode(on) {
+  viewer.setMarkMode(on);
+  ui.mark.setAttribute('aria-pressed', String(on));
+  if (on) { openSheet(false); toast('Rahmen um den Bereich ziehen, der geschwärzt werden soll. Wischen ist jetzt aus.', 4000); }
 }
 
 // ---------------------------------------------------------------------------
@@ -420,36 +559,32 @@ function ensurePdfName(name) {
   return /\.pdf$/i.test(name) ? name : `${name}.pdf`;
 }
 
-async function save(fromTap) {
-  if (!state.result || state.stale) return toast('Bitte zuerst „Schwärzen“.');
+function openSave() {
+  if (!ui.saveName.value) ui.saveName.value = state.file.name;
+  const ios = matchMedia('(pointer: coarse)').matches;
+  ui.saveHint.textContent = state.file.handle
+    ? 'Bei gleichem Namen wird die geöffnete Datei überschrieben.'
+    : ios ? 'Im nächsten Schritt „In Dateien sichern“ wählen. Für denselben Namen den Ordner des Originals wählen und „Ersetzen“ bestätigen.'
+      : 'Die Datei wird heruntergeladen.';
+  ui.saveDlg.showModal();
+}
+
+async function save() {
   const name = ensurePdfName(ui.saveName.value);
   ui.saveName.value = name;
   const blob = new Blob([state.result.bytes], { type: 'application/pdf' });
   try {
-    // 1) Desktop: Originaldatei direkt überschreiben
     if (state.file.handle && name === state.file.name) {
       const w = await state.file.handle.createWritable();
       await w.write(blob);
       await w.close();
-      return toast(`Gespeichert: ${name} (überschrieben)`);
+      return toast(`Gespeichert: ${name}`);
     }
-    // 2) iPhone/iPad: Teilen-Menü → „In Dateien sichern“ (lokal, kein Upload)
     const file = new File([blob], name, { type: 'application/pdf' });
-    const touch = matchMedia('(pointer: coarse)').matches;
-    if (touch && navigator.canShare?.({ files: [file] })) {
-      try {
-        await navigator.share({ files: [file] });
-        return;
-      } catch (e) {
-        if (e.name === 'AbortError') return;
-        if (e.name === 'NotAllowedError' && !fromTap) {
-          ui.save.focus();
-          return toast('Bitte jetzt auf „Speichern“ tippen.', 5000);
-        }
-      }
+    if (matchMedia('(pointer: coarse)').matches && navigator.canShare?.({ files: [file] })) {
+      try { await navigator.share({ files: [file] }); return; } catch (e) { if (e.name === 'AbortError') return; }
     }
-    // 3) Desktop ohne Dateizugriff: Speichern-Dialog oder Download
-    if (window.showSaveFilePicker && fromTap) {
+    if (window.showSaveFilePicker) {
       const h = await window.showSaveFilePicker({ suggestedName: name, types: [{ description: 'PDF', accept: { 'application/pdf': ['.pdf'] } }] });
       const w = await h.createWritable();
       await w.write(blob);
@@ -469,128 +604,107 @@ async function save(fromTap) {
 }
 
 // ---------------------------------------------------------------------------
-// Ansicht
+// Einstellungen und Pseudonym-Tabelle
 // ---------------------------------------------------------------------------
 
-function showView(view) {
-  const from = view === 'result' ? ui.viewOriginal : ui.viewResult;
-  const to = view === 'result' ? ui.viewResult : ui.viewOriginal;
-  if (view === 'result' && !state.result) return;
-  // Gleiche Stelle im anderen Dokument zeigen (Seiten sind gleich groß)
-  const ratio = from.scrollHeight ? from.scrollTop / from.scrollHeight : 0;
-  state.view = view;
-  ui.viewOriginal.hidden = view !== 'original';
-  ui.viewResult.hidden = view !== 'result';
-  ui.tabOriginal.classList.toggle('active', view === 'original');
-  ui.tabResult.classList.toggle('active', view === 'result');
-  ui.mark.hidden = view !== 'original';
-  requestAnimationFrame(() => (to.scrollTop = ratio * to.scrollHeight));
+function renderTable() {
+  const rows = table.list();
+  if (!rows.length) {
+    ui.tableBox.replaceChildren(el('div', { class: 'none' }, 'Noch leer. Wenn du Funde „ersetzt“, landen die Ersatzwerte hier.'));
+    return;
+  }
+  ui.tableBox.replaceChildren(el('table', {}, el('tbody', {}, rows.map((r) => el('tr', {},
+    el('td', { class: 'k' }, `${r.label || r.kind}`, el('br'), r.hint),
+    el('td', { class: 'f' }, r.fake),
+    el('td', { class: 'x' }, el('button', { type: 'button', 'aria-label': 'Eintrag löschen', onclick: () => { table.remove(r.hash); renderTable(); } }, '✕')),
+  )))));
 }
 
-function setMarkMode(on) {
-  viewerOriginal.setMarkMode(on);
-  ui.mark.setAttribute('aria-pressed', String(on));
-  if (on) setStatus('Ziehe mit dem Finger einen Rahmen um den Bereich, der geschwärzt werden soll. Zum Scrollen den Modus beenden.');
+function openSettings() {
+  ui.setDefault.value = settings.defaultAction;
+  ui.setLow.checked = settings.preselectLow;
+  ui.setDpi.value = String(settings.dpi);
+  ui.setRasterAll.checked = settings.rasterAll;
+  renderTable();
+  ui.settings.showModal();
 }
 
-// ---------------------------------------------------------------------------
-// Sprache
-// ---------------------------------------------------------------------------
-
-const speech = new LocalSpeech({
-  onProgress: (p) => {
-    if (p.status === 'progress' && p.total) {
-      setStatus(`Sprachmodell wird geladen (einmalig): ${Math.round((p.loaded / p.total) * 100)} % von ${p.file}`, 'busy');
-    }
-  },
-  onState: (s) => {
-    ui.mic.classList.toggle('recording', s === 'recording');
-    ui.mic.classList.toggle('working', s === 'transcribing');
-    if (s === 'recording') setStatus('Ich höre zu … (tippe erneut zum Beenden)');
-    if (s === 'transcribing') setStatus(speech.ready ? 'Erkenne Sprache (lokal) …' : 'Warte auf Sprachmodell …', 'busy');
-  },
+ui.settings.addEventListener('close', () => {
+  const rasterChanged = settings.rasterAll !== ui.setRasterAll.checked || settings.dpi !== Number(ui.setDpi.value);
+  settings.defaultAction = ui.setDefault.value;
+  settings.preselectLow = ui.setLow.checked;
+  settings.dpi = Number(ui.setDpi.value);
+  settings.rasterAll = ui.setRasterAll.checked;
+  storeSettings();
+  if (rasterChanged && state.result) changed();
 });
-speech.model = settings.model;
-speech.onAutoStop = () => finishRecording();
 
-function modelDownloaded() {
-  try { return localStorage.getItem(`pdfredact.model.${settings.model}`) === '1'; } catch { return false; }
-}
-
-async function toggleMic() {
-  if (speech.recording) return finishRecording();
-  if (ui.mic.classList.contains('working')) return;
-  if (!speech.supported) return toast('Mikrofon wird von diesem Browser nicht unterstützt – bitte tippen.');
-  if (!speech.ready && !modelDownloaded()) {
-    const size = ui.setModel.selectedOptions[0]?.textContent.split(',').pop().trim() || '';
-    if (!confirm(`Für die Spracherkennung wird einmalig ein Sprachmodell (${size}) auf dieses Gerät geladen. Danach funktioniert sie offline. Deine Aufnahmen verlassen das Gerät nie.\n\nJetzt laden?`)) return;
+ui.btnExport.addEventListener('click', () => {
+  const blob = new Blob([table.export()], { type: 'application/json' });
+  const name = `pseudonym-tabelle-${new Date().toISOString().slice(0, 10)}.json`;
+  const file = new File([blob], name, { type: 'application/json' });
+  if (matchMedia('(pointer: coarse)').matches && navigator.canShare?.({ files: [file] })) {
+    navigator.share({ files: [file] }).catch(() => {});
+    return;
   }
+  const a = el('a', { href: URL.createObjectURL(blob), download: name });
+  a.click();
+});
+ui.btnImport.addEventListener('click', () => { ui.importInput.value = ''; ui.importInput.click(); });
+ui.importInput.addEventListener('change', async () => {
   try {
-    await speech.start(); // direkt im Tipp-Ereignis (iOS-Vorgabe)
-    speech.load(settings.model).then(() => {
-      try { localStorage.setItem(`pdfredact.model.${settings.model}`, '1'); } catch { /* egal */ }
-      if (speech.recording) setStatus('Ich höre zu … (tippe erneut zum Beenden)');
-    }).catch((e) => reportError(e, 'Sprachmodell konnte nicht geladen werden.'));
-  } catch (e) {
-    reportError(e, e.name === 'NotAllowedError' ? 'Kein Mikrofonzugriff – bitte in den Einstellungen erlauben.' : 'Aufnahme nicht möglich.');
-  }
-}
-
-async function finishRecording() {
-  try {
-    const text = await speech.stop();
-    ui.mic.classList.remove('recording', 'working');
-    if (!text) return setStatus('Nichts verstanden – bitte noch einmal.', 'error');
-    ui.input.value = text;
-    await runCommand(text);
-  } catch (e) {
-    ui.mic.classList.remove('recording', 'working');
-    reportError(e, 'Spracherkennung fehlgeschlagen.');
-  }
-}
+    table.import(await ui.importInput.files[0].text());
+    renderTable();
+    toast('Tabelle wiederhergestellt.');
+  } catch (e) { reportError(e, 'Wiederherstellen fehlgeschlagen.'); }
+});
+ui.btnClearTable.addEventListener('click', () => {
+  if (!confirm('Alle gemerkten Ersatzwerte löschen?')) return;
+  table.clear();
+  renderTable();
+});
 
 // ---------------------------------------------------------------------------
-// Fehler, Einstellungen, Ereignisse
+// Ereignisse
 // ---------------------------------------------------------------------------
-
-function reportError(e, msg = 'Fehler') {
-  console.error(e);
-  setStatus(`${msg} ${e?.message ? `(${e.message})` : ''}`, 'error');
-}
 
 ui.open.addEventListener('click', pickFile);
 ui.open2.addEventListener('click', pickFile);
-ui.fileInput.addEventListener('change', () => ui.fileInput.files[0] && openFile(ui.fileInput.files[0]));
-ui.tabOriginal.addEventListener('click', () => showView('original'));
-ui.tabResult.addEventListener('click', () => showView('result'));
-ui.mark.addEventListener('click', () => setMarkMode(!viewerOriginal.markMode));
-ui.form.addEventListener('submit', (e) => { e.preventDefault(); ui.input.blur(); runCommand(ui.input.value); });
-ui.mic.addEventListener('click', toggleMic);
-ui.undo.addEventListener('click', undo);
-ui.apply.addEventListener('click', applyRedaction);
-ui.save.addEventListener('click', () => save(true));
-
-ui.setModel.value = settings.model;
-ui.setDpi.value = String(settings.dpi);
-ui.setRasterAll.checked = settings.rasterAll;
-ui.btnSettings.addEventListener('click', () => ui.settings.showModal());
-ui.settings.addEventListener('close', () => {
-  settings.model = ui.setModel.value;
-  settings.dpi = Number(ui.setDpi.value);
-  if (settings.rasterAll !== ui.setRasterAll.checked && state.result) changed();
-  settings.rasterAll = ui.setRasterAll.checked;
-  speech.model = settings.model;
-  storeSettings();
+ui.fileInput.addEventListener('change', () => {
+  const f = ui.fileInput.files[0];
+  ui.fileInput.value = ''; // dieselbe Datei später erneut öffnen können
+  if (f) openFile(f);
 });
-ui.clearModel.addEventListener('click', async () => {
-  await caches.delete('transformers-cache').catch(() => {});
-  try { Object.keys(localStorage).filter((k) => k.startsWith('pdfredact.model.')).forEach((k) => localStorage.removeItem(k)); } catch { /* egal */ }
-  speech.ready = false;
-  speech.loading = null;
-  toast('Sprachmodell gelöscht.');
+ui.btnSettings.addEventListener('click', openSettings);
+ui.zoom.addEventListener('click', () => viewer.toggleZoom(0));
+ui.mark.addEventListener('click', () => setMarkMode(!viewer.markMode));
+ui.tabOriginal.addEventListener('click', () => setView('original'));
+ui.tabResult.addEventListener('click', () => setView('result'));
+ui.sheetHead.addEventListener('click', () => openSheet(!ui.sheet.classList.contains('open')));
+ui.scrim.addEventListener('click', () => openSheet(false));
+ui.primary.addEventListener('click', primaryAction);
+ui.hintForm.addEventListener('submit', (e) => { e.preventDefault(); ui.hintInput.blur(); applyHint(ui.hintInput.value); });
+ui.bulk.addEventListener('click', (e) => {
+  const a = e.target.dataset?.bulk;
+  if (!a) return;
+  for (const f of state.findings) {
+    if (state.filter !== 'alle' && f.risk !== state.filter) continue;
+    if (a === 'replace' && !f.fake) continue;
+    if (f.cat === 'manual' && a === 'keep') continue;
+    f.action = a;
+  }
+  changed();
+});
+ui.saveDlg.addEventListener('close', () => { if (ui.saveDlg.returnValue === 'save') save(); });
+
+// Pfeiltasten am Computer
+document.addEventListener('keydown', (e) => {
+  if (!state.doc || e.target.closest('input, textarea, select, dialog')) return;
+  const map = { ArrowRight: 'next', ArrowLeft: 'prev', ArrowDown: 'down', ArrowUp: 'up' };
+  if (map[e.key]) { e.preventDefault(); viewer[map[e.key]](); }
+  if (e.key === 'z') viewer.toggleZoom(0);
 });
 
-// Datei per Drag & Drop (Desktop)
 document.addEventListener('dragover', (e) => e.preventDefault());
 document.addEventListener('drop', (e) => {
   e.preventDefault();
@@ -598,10 +712,9 @@ document.addEventListener('drop', (e) => {
   if (f) openFile(f);
 });
 
-// Offline-Fähigkeit (App-Dateien im Gerät zwischenspeichern)
 if ('serviceWorker' in navigator && location.protocol === 'https:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 
 // Für automatisierte Tests
-window.__pdfRedact = { state, runCommand, openFile, applyRedaction };
+window.__pdfPrivacy = { state, viewer, table, openFile, applyAll, applyHint, setAction };

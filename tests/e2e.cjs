@@ -1,46 +1,47 @@
 // End-to-End-Test im echten Browser (Chromium/Playwright):
-// Test-PDF erzeugen → App öffnen → Befehle eingeben → schwärzen → Ergebnis gründlich prüfen.
+// Test-PDF erzeugen → App öffnen → automatische Funde prüfen → schwärzen/ersetzen → Ergebnis gründlich prüfen
+// → dasselbe PDF erneut öffnen und prüfen, ob die Ersatzwerte aus der Tabelle wieder vorgeschlagen werden.
 // Aufruf: node tests/e2e.cjs   (startet selbst einen lokalen Webserver)
 
 const { chromium } = require('playwright');
 const http = require('http');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const zlib = require('zlib');
 const { PDFDocument, StandardFonts, rgb } = require('../vendor/pdf-lib/pdf-lib.min.js');
 
 const ROOT = path.join(__dirname, '..');
-const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.wasm': 'application/wasm', '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.webmanifest': 'application/manifest+json' };
+const OUT = process.env.E2E_OUT || os.tmpdir();
+const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.webmanifest': 'application/manifest+json' };
 
-const SECRETS = ['max.mustermann@example.de', 'DE89 3704 0044 0532 0130 00', 'Mustermann', '0221 / 123 456-78', '4711-0815', 'GEHEIMPROJEKT'];
+const IBAN = 'DE89 3704 0044 0532 0130 00';
+const SECRETS = ['max.mustermann@example.de', IBAN, 'Mustermann', '0221 / 123 456-78', '12 150380 M 123', 'KV-4711/0815', 'GEHEIMPROJEKT', 'Diabetes'];
 
 async function makePdf() {
   const doc = await PDFDocument.create();
   doc.setTitle('Vertrag Max Mustermann');
   doc.setAuthor('Max Mustermann');
-  doc.setKeywords(['max.mustermann@example.de']);
   const font = await doc.embedFont(StandardFonts.Helvetica);
   const p1 = doc.addPage([595, 842]);
   const lines = [
-    'Sehr geehrter Herr Max Mustermann,',
-    'Ihre Kundennummer: 4711-0815',
+    'Herrn Max Mustermann',
+    'Musterstraße 12a',
+    '50667 Köln',
+    '',
+    'Versicherungsnummer: 12 150380 M 123',
+    'Vertragsnummer: KV-4711/0815',
+    'Sehr geehrter Herr Mustermann,',
     'E-Mail: max.mustermann@example.de',
     'Telefon: 0221 / 123 456-78',
     'IBAN: DE89 3704 0044 0532 0130 00',
+    'Diagnose: Diabetes',
     'Dieser Satz bleibt stehen.',
   ];
-  lines.forEach((t, i) => p1.drawText(t, { x: 60, y: 760 - i * 28, size: 13, font, color: rgb(0, 0, 0) }));
-  // Unsichtbarer Text (weiß, winzig) – muss ebenfalls gefunden und entfernt werden
+  lines.forEach((t, i) => t && p1.drawText(t, { x: 60, y: 770 - i * 24, size: 12, font, color: rgb(0, 0, 0) }));
   p1.drawText('Mustermann GEHEIMPROJEKT', { x: 60, y: 300, size: 2, font, color: rgb(1, 1, 1) });
   const p2 = doc.addPage([595, 842]);
-  p2.drawText('Seite zwei ohne personenbezogene Inhalte.', { x: 60, y: 760, size: 13, font });
-  // Formularfeld mit Namen
-  const form = doc.getForm();
-  const tf = form.createTextField('kunde');
-  tf.setText('Mustermann');
-  tf.addToPage(p2, { x: 60, y: 600, width: 200, height: 24 });
-  const p3 = doc.addPage([595, 842]);
-  p3.drawText('Seite drei bleibt als Text erhalten.', { x: 60, y: 760, size: 13, font });
+  p2.drawText('Seite zwei bleibt als Text erhalten.', { x: 60, y: 760, size: 13, font });
   doc.attach(Buffer.from('Max Mustermann'), 'notiz.txt', { mimeType: 'text/plain' });
   return Buffer.from(await doc.save({ useObjectStreams: false }));
 }
@@ -58,7 +59,6 @@ function serve() {
   });
 }
 
-/** Alle Flate-Streams entpacken und zusammen mit dem Rohinhalt als Text liefern. */
 function rawText(buf) {
   let out = buf.toString('latin1');
   const rx = /stream\r?\n/g;
@@ -68,7 +68,6 @@ function rawText(buf) {
     const end = out.indexOf('endstream', start);
     try { out += zlib.inflateSync(buf.subarray(start, end)).toString('latin1'); } catch { /* kein Flate */ }
   }
-  // Hex-Strings <4D7573...> (so schreiben viele Programme Text in Inhaltsströme)
   return out + out.replace(/<([0-9A-Fa-f\s]{4,})>/g, (_, h) => Buffer.from(h.replace(/\s/g, ''), 'hex').toString('latin1'));
 }
 
@@ -76,61 +75,91 @@ function rawText(buf) {
   const srv = await serve();
   const url = `http://localhost:${srv.address().port}/`;
   const pdf = await makePdf();
-  const tmp = path.join(require('os').tmpdir(), 'testvertrag.pdf');
+  const tmp = path.join(os.tmpdir(), 'testvertrag.pdf');
   fs.writeFileSync(tmp, pdf);
-  const before = rawText(pdf);
-  for (const s of ['Mustermann', 'max.mustermann@example.de']) if (!before.includes(s)) throw new Error(`Testaufbau: ${s} fehlt im Original`);
 
   const browser = await chromium.launch();
-  const page = await browser.newPage({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2 });
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, hasTouch: true, isMobile: true });
   const errors = [];
+  const external = [];
   page.on('pageerror', (e) => errors.push(e.message));
   page.on('console', (m) => m.type() === 'error' && errors.push(m.text()));
+  page.on('request', (r) => { if (!r.url().startsWith(url) && !r.url().startsWith('blob:') && !r.url().startsWith('data:')) external.push(r.url()); });
+
+  let failed = 0;
+  const check = (ok, msg) => { console.log(`${ok ? '✓' : '✗'} ${msg}`); if (!ok) failed++; };
+
   await page.goto(url);
+  await page.screenshot({ path: path.join(OUT, 'e2e-0-start.png') });
   await page.setInputFiles('#fileInput', tmp);
-  await page.waitForFunction(() => window.__pdfRedact.state.models.length === 3);
+  await page.waitForFunction(() => window.__pdfPrivacy.state.findings.length > 0, null, { timeout: 30000 });
+  await page.waitForTimeout(400);
+  await page.screenshot({ path: path.join(OUT, 'e2e-1-funde.png') });
 
-  const commands = [
-    'Entferne alle E-Mail-Adressen und Telefonnummern.',
-    'Schwärze den Namen Max Mustermann',
-    'Lösche die IBAN',
-    'Entferne die Kundennummer',
-    'Entferne das Wort Geheimprojekt',
-  ];
-  for (const c of commands) {
-    await page.fill('#cmdInput', c);
-    await page.press('#cmdInput', 'Enter');
+  const findings = await page.evaluate(() => window.__pdfPrivacy.state.findings.map((f) => ({ cat: f.cat, label: f.label, value: f.value, risk: f.risk, action: f.action, fake: f.fake })));
+  console.log(findings.map((f) => `  ${f.risk.padEnd(7)} ${f.label.padEnd(22)} ${f.value}  [${f.action}]  → ${f.fake}`).join('\n'));
+  const has = (v) => findings.some((f) => f.value === v);
+  for (const v of ['Max Mustermann', IBAN, '12 150380 M 123', 'KV-4711/0815', 'max.mustermann@example.de', '0221 / 123 456-78', 'Musterstraße 12a', '50667 Köln', 'Diabetes']) {
+    check(has(v), `Automatisch erkannt: ${v}`);
   }
-  const summary = await page.evaluate(() => window.__pdfRedact.state.rules.map((r) => `${r.kind}:${r.cat || r.term} → ${r.matches.map((m) => m.text).join(' | ')}`));
-  console.log(summary.join('\n'));
+  check(findings.every((f) => f.risk !== 'hoch' || f.action !== 'keep'), 'Alle Funde mit hohem Risiko sind vorausgewählt');
 
-  // „Rückgängig“ per Befehl und manuelles Markieren einer Fläche auf Seite 3
-  await page.fill('#cmdInput', 'Entferne das Wort bleibt');
-  await page.press('#cmdInput', 'Enter');
-  await page.fill('#cmdInput', 'rückgängig');
-  await page.press('#cmdInput', 'Enter');
-  const ruleCount = await page.evaluate(() => window.__pdfRedact.state.rules.length);
-  await page.click('#btnMark');
-  const svg = page.locator('.page[data-index="2"] svg');
-  await svg.scrollIntoViewIfNeeded();
-  const box = await svg.boundingBox();
-  await page.mouse.move(box.x + box.width * 0.6, box.y + box.height * 0.5);
-  await page.mouse.down();
-  await page.mouse.move(box.x + box.width * 0.8, box.y + box.height * 0.55, { steps: 5 });
-  await page.mouse.up();
-  await page.click('#btnMark');
-  const manual = await page.evaluate(() => window.__pdfRedact.state.manual?.matches.length || 0);
+  // IBAN, Name und E-Mail ersetzen, Rest schwärzen
+  await page.evaluate(() => {
+    const { state, setAction } = window.__pdfPrivacy;
+    for (const f of state.findings) if (['iban', 'names', 'email', 'svnr'].includes(f.cat)) setAction(f, 'replace');
+  });
+  const fakes = await page.evaluate(() => Object.fromEntries(window.__pdfPrivacy.state.findings.filter((f) => f.action === 'replace').map((f) => [f.cat, f.fake])));
+  check(/^DE\d{2} \d{4} \d{4} \d{4} \d{4} \d{2}$/.test(fakes.iban), `Ersatz-IBAN hat dieselbe Struktur: ${fakes.iban}`);
 
-  await page.fill('#cmdInput', 'schwärzen');
-  await page.press('#cmdInput', 'Enter');
-  await page.waitForFunction(() => window.__pdfRedact.state.result, null, { timeout: 60000 });
-  await page.screenshot({ path: path.join(require('os').tmpdir(), 'e2e-result.png') });
+  // Hinweis per Texteingabe (entspricht Diktat)
+  if (!(await page.evaluate(() => document.getElementById('sheet').classList.contains('open')))) await page.click('#sheetHead');
+  await page.fill('#hintInput', 'auch Geheimprojekt');
+  await page.press('#hintInput', 'Enter');
+  await page.waitForTimeout(200);
+  check(await page.evaluate(() => window.__pdfPrivacy.state.findings.some((f) => f.cat === 'hint' && /GEHEIMPROJEKT/.test(f.value))), 'Hinweis „auch Geheimprojekt“ findet versteckten Text');
+  await page.screenshot({ path: path.join(OUT, 'e2e-2-liste.png') });
+  await page.click('#scrim', { position: { x: 200, y: 40 } });
+
+  // Lupe + Wischen
+  await page.click('#btnZoom');
+  await page.waitForTimeout(350);
+  await page.screenshot({ path: path.join(OUT, 'e2e-3-lupe.png') });
+  const swipe = async (dx, dy) => {
+    const b = await page.locator('#viewer').boundingBox();
+    const x = b.x + b.width / 2, y = b.y + b.height / 2;
+    await page.mouse.move(x, y); await page.mouse.down();
+    await page.mouse.move(x + dx, y + dy, { steps: 6 }); await page.mouse.up();
+    await page.waitForTimeout(350);
+  };
+  await swipe(-120, 0);
+  let v = await page.evaluate(() => ({ q: window.__pdfPrivacy.viewer.q, i: window.__pdfPrivacy.viewer.index }));
+  check(v.q === 1 && v.i === 0, 'Wischen nach links → Viertel oben rechts');
+  await swipe(-120, 0); await swipe(-120, 0);
+  v = await page.evaluate(() => ({ q: window.__pdfPrivacy.viewer.q, i: window.__pdfPrivacy.viewer.index }));
+  check(v.q === 3, 'Weiter wischen → unten rechts');
+  await swipe(-120, 0);
+  await page.waitForTimeout(400);
+  v = await page.evaluate(() => ({ q: window.__pdfPrivacy.viewer.q, i: window.__pdfPrivacy.viewer.index }));
+  check(v.q === 0 && v.i === 1, 'Nach dem letzten Viertel → nächste Seite oben links');
+  await swipe(120, 0);
+  await page.waitForTimeout(400);
+  await page.click('#btnZoom');
+  await swipe(120, 0);
+  await page.waitForTimeout(400);
+  v = await page.evaluate(() => ({ z: window.__pdfPrivacy.viewer.zoom, i: window.__pdfPrivacy.viewer.index }));
+  check(!v.z && v.i === 0, 'Lupe aus, zurück auf Seite 1');
+
+  // Anwenden
+  await page.click('#btnPrimary');
+  await page.waitForFunction(() => window.__pdfPrivacy.state.result, null, { timeout: 60000 });
+  await page.waitForTimeout(500);
+  await page.screenshot({ path: path.join(OUT, 'e2e-4-nachher.png') });
   const verify = await page.textContent('#verify');
   console.log('Prüfbericht:', verify);
-  const outBytes = Buffer.from(await page.evaluate(() => Array.from(window.__pdfRedact.state.result.bytes)));
-  fs.writeFileSync(path.join(require('os').tmpdir(), 'testvertrag-geschwaerzt.pdf'), outBytes);
+  const outBytes = Buffer.from(await page.evaluate(() => Array.from(window.__pdfPrivacy.state.result.bytes)));
+  fs.writeFileSync(path.join(OUT, 'testvertrag-bereinigt.pdf'), outBytes);
 
-  // Unabhängige Prüfung: Text des Ergebnisses mit pdf.js extrahieren und Rohdaten durchsuchen
   const extracted = await page.evaluate(async (b64) => {
     const pdfjs = await import('./vendor/pdfjs/pdf.min.mjs');
     pdfjs.GlobalWorkerOptions.workerSrc = './vendor/pdfjs/pdf.worker.min.mjs';
@@ -141,22 +170,49 @@ function rawText(buf) {
     const meta = await doc.getMetadata();
     return { text: t, meta: JSON.stringify(meta.info), attachments: await doc.getAttachments(), pages: doc.numPages };
   }, outBytes.toString('base64'));
-  const raw = rawText(outBytes);
+  const raw = rawText(outBytes).toLowerCase();
 
-  let failed = 0;
-  const check = (ok, msg) => { console.log(`${ok ? '✓' : '✗'} ${msg}`); if (!ok) failed++; };
-  check(extracted.pages === 3, 'Seitenzahl unverändert');
+  check(extracted.pages === 2, 'Seitenzahl unverändert');
   for (const s of SECRETS) {
-    check(!extracted.text.includes(s) && !extracted.meta.includes(s), `„${s}“ nicht im extrahierten Text/Metadaten`);
-    check(!raw.toLowerCase().includes(s.toLowerCase()), `„${s}“ nicht in den Rohdaten`);
+    check(!extracted.text.includes(s) && !extracted.meta.includes(s) && !raw.includes(s.toLowerCase()), `„${s}“ nirgends mehr im PDF`);
   }
+  check(extracted.text.includes(fakes.iban), 'Ersatz-IBAN steht im Ergebnis (durchsuchbar)');
+  check(extracted.text.includes('Dieser Satz bleibt stehen.'), 'Nicht betroffener Text bleibt durchsuchbar');
+  check(extracted.text.includes('Seite zwei bleibt als Text erhalten.'), 'Unbetroffene Seite bleibt erhalten');
   check(!extracted.attachments, 'Keine Dateianhänge mehr');
-  check(ruleCount === 6, '„Rückgängig“ entfernt die letzte Regel');
-  check(manual === 1, 'Manuell markierter Bereich erfasst');
-  check(verify.includes('3 Seite(n) neu als Bild'), 'Seite mit manueller Markierung als Bild neu aufgebaut');
-  check(extracted.text.includes('Dieser Satz bleibt stehen.'), 'Nicht geschwärzter Text bleibt durchsuchbar (unsichtbare Textebene)');
   check(verify.includes('✓'), 'App-eigene Prüfung meldet Erfolg');
+
+  // Tabelle: Originale nicht im Klartext gespeichert
+  const stored = await page.evaluate(() => localStorage.getItem('pdfprivacy.pseudonyms'));
+  check(stored && !stored.includes('Mustermann') && !stored.includes('3704') && stored.includes(fakes.iban), 'Tabelle enthält Ersatzwerte, aber keine Originale');
+
+  // Vorher/Nachher an derselben Stelle
+  await page.click('#tabOriginal');
+  await page.waitForTimeout(300);
+  await page.click('#tabResult');
+  await page.waitForTimeout(300);
+
+  // Dasselbe Dokument erneut öffnen → Ersatzwerte werden wiedererkannt
+  await page.setInputFiles('#fileInput', tmp);
+  await page.waitForFunction(() => !window.__pdfPrivacy.state.result && window.__pdfPrivacy.state.findings.length > 0, null, { timeout: 30000 });
+  await page.waitForTimeout(300);
+  const again = await page.evaluate(() => window.__pdfPrivacy.state.findings.map((f) => ({ cat: f.cat, fake: f.fake, known: f.known, action: f.action })));
+  const iban2 = again.find((f) => f.cat === 'iban');
+  check(iban2.known && iban2.fake === fakes.iban && iban2.action === 'replace', 'Bekannte IBAN: gleicher Ersatz wird vorgeschlagen');
+  check(again.find((f) => f.cat === 'names')?.fake === fakes.names, 'Bekannter Name: gleicher Ersatz wird vorgeschlagen');
+  await page.waitForTimeout(300);
+  await page.screenshot({ path: path.join(OUT, 'e2e-5-bekannt.png') });
+
+  check(!external.length, `Keine Verbindungen nach außen ${external.join(' ')}`);
   check(!errors.length, `Keine JS-Fehler ${errors.join('; ')}`);
+
+  // Dunkler Modus (nur Bildschirmfoto)
+  const dark = await browser.newPage({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, colorScheme: 'dark' });
+  await dark.goto(url);
+  await dark.setInputFiles('#fileInput', tmp);
+  await dark.waitForFunction(() => window.__pdfPrivacy.state.findings.length > 0);
+  await dark.waitForTimeout(400);
+  await dark.screenshot({ path: path.join(OUT, 'e2e-6-dunkel.png') });
 
   await browser.close();
   srv.close();

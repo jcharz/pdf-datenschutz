@@ -1,4 +1,4 @@
-// Sicheres Schwärzen: Betroffene Seiten werden als Bild neu aufgebaut (der Text existiert danach
+// Sicheres Schwärzen und Ersetzen: Betroffene Seiten werden als Bild neu aufgebaut (der Text existiert danach
 // nicht mehr), alle übrigen Seiten werden ohne Metadaten, Kommentare, Formulare, Lesezeichen,
 // Anhänge und Skripte in ein komplett neues PDF übernommen. Danach wird das Ergebnis geprüft.
 
@@ -14,8 +14,80 @@ async function canvasToJpeg(canvas) {
   return new Uint8Array(await blob.arrayBuffer());
 }
 
-/** Rendert eine Seite als Bild und malt die Schwärzungen direkt in die Pixel. */
-async function rasterizePage(page, quads, dpi) {
+function polyPath(ctx, vp, q) {
+  ctx.beginPath();
+  q.forEach(([x, y], i) => {
+    const [px, py] = vp.convertToViewportPoint(x, y);
+    i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+  });
+  ctx.closePath();
+}
+
+/** Hintergrund- und Schriftfarbe im Bereich der Vierecke aus dem gerenderten Bild ablesen. */
+function sampleColors(ctx, vp, quads) {
+  const pts = quads.flat().map(([x, y]) => vp.convertToViewportPoint(x, y));
+  const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+  const x0 = Math.max(0, Math.floor(Math.min(...xs))), y0 = Math.max(0, Math.floor(Math.min(...ys)));
+  const w = Math.max(1, Math.min(ctx.canvas.width - x0, Math.ceil(Math.max(...xs)) - x0));
+  const h = Math.max(1, Math.min(ctx.canvas.height - y0, Math.ceil(Math.max(...ys)) - y0));
+  const data = ctx.getImageData(x0, y0, w, h).data;
+  const px = [];
+  const step = Math.max(1, Math.floor((w * h) / 4000));
+  for (let i = 0; i < w * h; i += step) {
+    const r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2];
+    px.push([0.299 * r + 0.587 * g + 0.114 * b, r, g, b]);
+  }
+  px.sort((a, b) => a[0] - b[0]);
+  const at = (f) => px[Math.min(px.length - 1, Math.floor(f * px.length))];
+  const bg = at(0.9), fg = at(0.03);
+  const css = (p) => `rgb(${p[1]},${p[2]},${p[3]})`;
+  // Kaum Kontrast → schwarze Schrift auf gefundenem Hintergrund
+  return { bg: css(bg), fg: bg[0] - fg[0] > 60 ? css(fg) : '#000' };
+}
+
+function lowContrast(ctx, vp, q) {
+  const pts = q.map(([x, y]) => vp.convertToViewportPoint(x, y));
+  const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+  const x0 = Math.max(0, Math.floor(Math.min(...xs))), y0 = Math.max(0, Math.floor(Math.min(...ys)));
+  const w = Math.max(1, Math.min(ctx.canvas.width - x0, Math.ceil(Math.max(...xs)) - x0));
+  const h = Math.max(1, Math.min(ctx.canvas.height - y0, Math.ceil(Math.max(...ys)) - y0));
+  const d = ctx.getImageData(x0, y0, w, h).data;
+  let min = 255, max = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    const l = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    if (l < min) min = l;
+    if (l > max) max = l;
+  }
+  return max - min < 25;
+}
+
+/** Ersatztext an die Stelle des Originals malen (gleiche Grundlinie, Größe, Drehung, Farbe). */
+function paintReplacement(ctx, vp, rep) {
+  const quads = rep.segments.map((s) => s.quad);
+  const { bg, fg } = sampleColors(ctx, vp, quads);
+  ctx.fillStyle = bg;
+  for (const q of quads) { polyPath(ctx, vp, q); ctx.fill(); }
+  const g = rep.segments.find((s) => s.geom)?.geom;
+  if (!g || !rep.text) return;
+  const sameLine = rep.segments.filter((s) => s.geom && Math.abs(s.geom.baseline[1] - g.baseline[1]) < g.size * 0.5);
+  const avail = sameLine.reduce((n, s) => n + s.geom.width, 0) || g.width;
+  const [bx, by] = vp.convertToViewportPoint(...g.baseline);
+  const px = g.size * vp.scale;
+  ctx.save();
+  ctx.translate(bx, by);
+  ctx.rotate(-g.angle);
+  ctx.font = `${px}px ${g.family}`;
+  const textW = ctx.measureText(rep.text).width;
+  const maxW = avail * vp.scale * 1.08;
+  if (textW > maxW) ctx.scale(Math.max(0.6, maxW / textW), 1);
+  ctx.fillStyle = fg;
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(rep.text, 0, 0);
+  ctx.restore();
+}
+
+/** Rendert eine Seite als Bild; Ersetzungen und Schwärzungen werden direkt in die Pixel gemalt. */
+async function rasterizePage(page, red, dpi) {
   const base = page.getViewport({ scale: 1 });
   let scale = dpi / 72;
   if (base.width * base.height * scale * scale > MAX_PIXELS) scale = Math.sqrt(MAX_PIXELS / (base.width * base.height));
@@ -23,21 +95,20 @@ async function rasterizePage(page, quads, dpi) {
   const canvas = document.createElement('canvas');
   canvas.width = Math.floor(vp.width);
   canvas.height = Math.floor(vp.height);
-  const ctx = canvas.getContext('2d', { alpha: false });
+  const ctx = canvas.getContext('2d', { alpha: false, willReadFrequently: true });
   ctx.fillStyle = '#fff';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   // annotationMode 1 = ENABLE: Formularfelder & Kommentare werden sichtbar ins Bild übernommen
   await page.render({ canvasContext: ctx, viewport: vp, annotationMode: 1 }).promise;
-  ctx.fillStyle = '#000';
-  for (const q of quads) {
-    ctx.beginPath();
-    q.forEach(([x, y], i) => {
-      const [px, py] = vp.convertToViewportPoint(x, y);
-      i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
-    });
-    ctx.closePath();
+  for (const rep of red.replacements) paintReplacement(ctx, vp, rep);
+  for (const q of red.quads) {
+    // Unsichtbarer Text (z. B. weiß auf weiß) bleibt unsichtbar: Hintergrundfarbe statt schwarzem Balken
+    ctx.fillStyle = lowContrast(ctx, vp, q) ? sampleColors(ctx, vp, [q]).bg : '#000';
+    polyPath(ctx, vp, q);
     ctx.fill();
   }
+  ctx.fillStyle = '#000';
+  for (const q of red.blockQuads) { polyPath(ctx, vp, q); ctx.fill(); }
   const jpg = await canvasToJpeg(canvas);
   canvas.width = canvas.height = 0; // Speicher auf dem iPhone sofort freigeben
   return { jpg, width: base.width, height: base.height };
@@ -60,8 +131,10 @@ function addInvisibleText(page, font, runs) {
 }
 
 /**
- * Erzeugt das geschwärzte PDF.
- * redactions: Map<pageIndex, { quads, excluded: Set<Zeichenindex>, blockQuads }>; models: Textmodelle der Originalseiten.
+ * Erzeugt das bereinigte PDF.
+ * redactions: Map<pageIndex, { quads, replacements: [{segments, text}], excluded: Set<Zeichenindex>, blockQuads }>
+ *   quads = schwarz schwärzen, replacements = Original überdecken und Ersatztext einsetzen.
+ * models: Textmodelle der Originalseiten.
  */
 export async function redactPdf({ bytes, pdfDoc, redactions, models, rasterAll = false, dpi = 200, onProgress }) {
   let src = null;
@@ -72,16 +145,16 @@ export async function redactPdf({ bytes, pdfDoc, redactions, models, rasterAll =
   }
   const out = await PDFDocument.create({ updateMetadata: false });
   const font = await out.embedFont(StandardFonts.Helvetica);
-  const stats = { rasterized: 0, copied: 0, boxes: 0 };
+  const stats = { rasterized: 0, copied: 0, boxes: 0, replaced: 0 };
 
   for (let i = 0; i < pdfDoc.numPages; i++) {
     onProgress?.(i + 1, pdfDoc.numPages);
-    const red = redactions.get(i) || { quads: [], excluded: new Set(), blockQuads: [] };
-    const quads = red.quads;
-    stats.boxes += quads.length;
-    if (rasterAll || quads.length || models[i].hasAnnots) {
+    const red = { quads: [], replacements: [], excluded: new Set(), blockQuads: [], ...redactions.get(i) };
+    stats.boxes += red.quads.length + red.blockQuads.length;
+    stats.replaced += red.replacements.length;
+    if (rasterAll || red.quads.length || red.blockQuads.length || red.replacements.length || models[i].hasAnnots) {
       const page = await pdfDoc.getPage(i + 1);
-      const { jpg, width, height } = await rasterizePage(page, quads, dpi);
+      const { jpg, width, height } = await rasterizePage(page, red, dpi);
       const img = await out.embedJpg(jpg);
       const p = out.addPage([width, height]);
       p.drawImage(img, { x: 0, y: 0, width, height });
@@ -89,8 +162,12 @@ export async function redactPdf({ bytes, pdfDoc, redactions, models, rasterAll =
       const vp = page.getViewport({ scale: 1 });
       if (!vp.rotation) {
         const [x0, y0] = page.view;
-        const runs = remainingTextRuns(models[i], red.excluded, red.blockQuads)
-          .map((r) => ({ ...r, x: r.x - x0, y: r.y - y0 }));
+        const runs = remainingTextRuns(models[i], red.excluded, red.blockQuads);
+        for (const rep of red.replacements) {
+          const g = rep.segments.find((sg) => sg.geom)?.geom;
+          if (g && rep.text) runs.push({ str: rep.text, x: g.baseline[0], y: g.baseline[1], size: g.size, angle: (g.angle * 180) / Math.PI });
+        }
+        for (const r of runs) { r.x -= x0; r.y -= y0; }
         addInvisibleText(p, font, runs);
       }
       page.cleanup();

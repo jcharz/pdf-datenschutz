@@ -1,13 +1,13 @@
 {
-  "name": "PDF Schwärzen",
-  "short_name": "Schwärzen",
-  "description": "Daten aus PDFs per Sprache sicher entfernen – komplett lokal auf dem Gerät.",
+  "name": "PDF Datenschutz",
+  "short_name": "PDF Datenschutz",
+  "description": "Kritische Daten in PDFs finden, schwärzen oder ersetzen – komplett lokal auf dem Gerät.",
   "lang": "de",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
-  "background_color": "#111827",
-  "theme_color": "#111827",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
   "icons": [
     { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml" },
     { "src": "icons/icon-180.png", "sizes": "180x180", "type": "image/png" },
