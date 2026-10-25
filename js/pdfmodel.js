@@ -93,16 +93,42 @@ function annotQuad(a) {
   return [[x1, y1], [x2, y1], [x2, y2], [x1, y2]];
 }
 
-/** Alle Vierecke, die den Textbereich [start, end) abdecken. */
-export function quadsForRange(model, start, end) {
-  const quads = [];
+/** Geometrie eines Teilstücks [c0, c1) eines Textelements: Grundlinie, Schriftgröße, Breite, Drehung. */
+function itemGeometry(it, style, c0, c1) {
+  const [a, b, c, d, e, f] = it.transform;
+  const lenU = Math.hypot(a, b) || 1;
+  const size = Math.hypot(c, d) || it.height || lenU;
+  const W = style?.vertical ? it.height : it.width;
+  let f0 = c0 / it.str.length, f1 = c1 / it.str.length;
+  const full = measure(it.str, style?.fontFamily);
+  if (full > 0) {
+    f0 = measure(it.str.slice(0, c0), style?.fontFamily) / full;
+    f1 = measure(it.str.slice(0, c1), style?.fontFamily) / full;
+  }
+  const ux = a / lenU, uy = b / lenU;
+  return {
+    baseline: [e + ux * f0 * W, f + uy * f0 * W],
+    width: (f1 - f0) * W,
+    size,
+    angle: Math.atan2(b, a),
+    family: style?.fontFamily || 'sans-serif',
+  };
+}
+
+/**
+ * Teilstücke, die den Textbereich [start, end) abdecken – je Textelement eines.
+ * Rückgabe: [{ quad, geom }] (geom fehlt bei Formularfeldern/Kommentaren).
+ */
+export function segmentsForRange(model, start, end) {
+  const segs = [];
   let cur = null;
   const flush = () => {
     if (!cur) return;
-    if (cur.item < 0) quads.push(annotQuad(model.annots[-1 - cur.item]));
+    if (cur.item < 0) segs.push({ quad: annotQuad(model.annots[-1 - cur.item]) });
     else {
       const it = model.items[cur.item];
-      quads.push(itemQuad(it, model.styles[it.fontName], cur.c0, cur.c1));
+      const style = model.styles[it.fontName];
+      segs.push({ quad: itemQuad(it, style, cur.c0, cur.c1), geom: itemGeometry(it, style, cur.c0, cur.c1) });
     }
     cur = null;
   };
@@ -115,7 +141,55 @@ export function quadsForRange(model, start, end) {
     else { flush(); cur = { item, c0: ch, c1: ch + 1 }; }
   }
   flush();
-  return quads;
+  return segs;
+}
+
+/** Alle Vierecke, die den Textbereich [start, end) abdecken. */
+export function quadsForRange(model, start, end) {
+  return segmentsForRange(model, start, end).map((s) => s.quad);
+}
+
+// ---------------------------------------------------------------------------
+// Bilder auf der Seite (Unterschriften, Fotos, Stempel, eingescannte Seiten)
+// ---------------------------------------------------------------------------
+
+function mul(m, n) {
+  // erst n, dann m anwenden
+  return [
+    m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1],
+    m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3],
+    m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5],
+  ];
+}
+
+/** Findet gezeichnete Bilder und liefert ihre Fläche (PDF-Koordinaten) und den Anteil an der Seite. */
+export async function findImages(page, OPS) {
+  const list = await page.getOperatorList();
+  const [vx0, vy0, vx1, vy1] = page.view;
+  const pageArea = Math.abs((vx1 - vx0) * (vy1 - vy0)) || 1;
+  const out = [];
+  let ctm = [1, 0, 0, 1, 0, 0];
+  const stack = [];
+  const IMG = new Set([OPS.paintImageXObject, OPS.paintInlineImageXObject, OPS.paintImageMaskXObject, OPS.paintJpegXObject].filter(Boolean));
+  list.fnArray.forEach((fn, i) => {
+    const args = list.argsArray[i];
+    if (fn === OPS.save) stack.push(ctm);
+    else if (fn === OPS.restore) ctm = stack.pop() || ctm;
+    else if (fn === OPS.transform) ctm = mul(ctm, args);
+    else if (fn === OPS.paintFormXObjectBegin) { stack.push(ctm); if (Array.isArray(args?.[0]) || ArrayBuffer.isView(args?.[0])) ctm = mul(ctm, [...args[0]]); }
+    else if (fn === OPS.paintFormXObjectEnd) ctm = stack.pop() || ctm;
+    else if (IMG.has(fn)) {
+      const P = (x, y) => [ctm[0] * x + ctm[2] * y + ctm[4], ctm[1] * x + ctm[3] * y + ctm[5]];
+      const quad = [P(0, 0), P(1, 0), P(1, 1), P(0, 1)];
+      const xs = quad.map((q) => q[0]), ys = quad.map((q) => q[1]);
+      const w = Math.min(Math.max(...xs), vx1) - Math.max(Math.min(...xs), vx0);
+      const h = Math.min(Math.max(...ys), vy1) - Math.max(Math.min(...ys), vy0);
+      if (w <= 0 || h <= 0) return;
+      const share = (w * h) / pageArea;
+      if (share >= 0.002) out.push({ quad, share });
+    }
+  });
+  return out;
 }
 
 function bbox(q) {
@@ -151,15 +225,7 @@ export function remainingTextRuns(model, excluded, blockQuads = []) {
   flush();
   return runs.map((r) => {
     const it = model.items[r.item];
-    const [a, b, c, d] = it.transform;
-    const size = Math.hypot(c, d) || it.height || 10;
-    const quad = itemQuad(it, model.styles[it.fontName], r.c0, r.c1);
-    // Grundlinienpunkt am Anfang des Abschnitts (Rand wieder herausrechnen)
-    const pad = size * 0.15, lenU = Math.hypot(a, b) || 1;
-    const [qx, qy] = quad[0];
-    const vx = c / (Math.hypot(c, d) || 1), vy = d / (Math.hypot(c, d) || 1);
-    const x = qx + (a / lenU) * pad - vx * -size * 0.32;
-    const y = qy + (b / lenU) * pad - vy * -size * 0.32;
-    return { str: r.str, x, y, size, angle: (Math.atan2(b, a) * 180) / Math.PI };
+    const g = itemGeometry(it, model.styles[it.fontName], r.c0, r.c1);
+    return { str: r.str, x: g.baseline[0], y: g.baseline[1], size: g.size, angle: (g.angle * 180) / Math.PI };
   });
 }

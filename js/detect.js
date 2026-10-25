@@ -1,5 +1,7 @@
-// Lokale Sprachverarbeitung: versteht deutsche Befehle und findet Treffer im Text.
+// Lokale Erkennung: findet (möglicherweise) kritische Daten im Text und versteht deutsche Hinweise.
 // Keine Netzwerkzugriffe, keine Abhängigkeiten – läuft im Browser und in Node (Tests).
+
+import { FIRST_NAMES } from './data.js';
 
 // ---------------------------------------------------------------------------
 // Hilfsfunktionen
@@ -115,6 +117,7 @@ const DATE_ANY =
 const B = '(?<![\\p{L}\\p{N}])'; // Wortanfang (Unicode-fähig)
 const E = '(?![\\p{L}\\p{N}])'; // Wortende
 const CAP = "[A-ZÄÖÜ][a-zäöüß]+(?:-[A-ZÄÖÜ][a-zäöüß]+)?";
+const FN = [...FIRST_NAMES].sort((a, b) => b.length - a.length).join('|');
 
 function ibanValid(raw) {
   const s = raw.replace(/\s+/g, '').toUpperCase();
@@ -247,13 +250,168 @@ export const CATEGORIES = [
     say: /\b(namen|name|personennamen|personen|person|personendaten)\b/,
     patterns: [
       { rx: new RegExp(`(?<![\\p{L}])(?:Herrn?|Frau|Hr\\.|Fr\\.)[ ]+(?:(?:Dr|Prof|Dipl\\.-\\p{L}+)\\.?[ ]+)*((?:${CAP}[ ]+){0,2}${CAP})`, 'gu'), group: 1 },
-      { rx: new RegExp(`(?:Name|Vorname|Nachname|Familienname|Ansprechpartner(?:in)?|Kontoinhaber(?:in)?|Patient(?:in)?|Mandant(?:in)?|Empfänger(?:in)?|Absender(?:in)?|Unterzeichner(?:in)?|Inhaber(?:in)?)[ ]*:[ ]*((?:${CAP}[ ]+){0,2}${CAP})`, 'gu'), group: 1 },
+      { rx: new RegExp(`(?:Name|Vorname|Nachname|Familienname|Geburtsname|Ansprechpartner(?:in)?|Kontoinhaber(?:in)?|Patient(?:in)?|Mandant(?:in)?|Empfänger(?:in)?|Absender(?:in)?|Unterzeichner(?:in)?|Inhaber(?:in)?|Versicherte[rn]?|Antragsteller(?:in)?|Bearbeiter(?:in)?|Sachbearbeiter(?:in)?|Ehepartner(?:in)?|Kind|Vater|Mutter|Arzt|Ärztin|Mieter(?:in)?|Vermieter(?:in)?|Kunde|Kundin|Schuldner(?:in)?|Gläubiger(?:in)?)[ ]*:[ ]*((?:${CAP}[ ]+){0,2}${CAP})`, 'gu'), group: 1 },
       { rx: new RegExp(`(?:Mit freundlichen Grüßen|Viele Grüße|Beste Grüße|Freundliche Grüße|Hochachtungsvoll)[,]?\\s*\\n\\s*((?:${CAP}[ ]+){0,2}${CAP})`, 'gu'), group: 1 },
+      // Bekannter Vorname + großgeschriebenes Wort („Erika Meyer“, „Anna Maria Schmidt“)
+      { rx: new RegExp(`(?<![\\p{L}])((?:${FN})(?:[ ]+(?:${FN}))?[ ]+${CAP})(?![\\p{L}])`, 'gu'), group: 1 },
     ],
     // Gefundene Namen werden überall im Dokument gesucht (auch ohne Anrede).
     propagate: true,
   },
+  {
+    id: 'idnumber', label: 'Kennnummern (Versicherungs-, Kunden-, Vertragsnummern …)',
+    say: /\b(kennnummer\w*|kundennummern|vertragsnummern|aktenzeichen|nummern|ids?|kennzeichen)\b/,
+    find: findLabeledIds,
+    patterns: [],
+  },
+  {
+    id: 'personal', label: 'Persönliche Angaben (Geburtsort, Gesundheit, Religion …)',
+    say: /\b(gesundheit\w*|diagnose\w*|religion\w*|persoenliche angaben|geburtsort\w*|staatsangehoerigkeit\w*)\b/,
+    find: findPersonal,
+    patterns: [],
+  },
+  {
+    id: 'kfz', label: 'Kfz-Kennzeichen',
+    say: /\b(kfz\w*|autokennzeichen\w*|nummernschild\w*)\b/,
+    patterns: [{ rx: /(?<![\p{L}\p{N}\-])[A-ZÄÖÜ]{1,3}-[A-Z]{1,2}[ ]?\d{1,4}[EH]?(?![\p{L}\p{N}])/gu }],
+  },
+  {
+    id: 'number', label: 'Sonstige Nummern',
+    say: /\b(zahlen|ziffern|nummernfolgen)\b/,
+    find: findLongNumbers,
+    patterns: [],
+  },
 ];
+
+// ---------------------------------------------------------------------------
+// Automatischer Scan: alle Kategorien, bewertet und nach Wert gruppiert
+// ---------------------------------------------------------------------------
+
+/** Reihenfolge = Vorrang bei Überschneidungen (spezifisch vor allgemein). */
+const SCAN_ORDER = ['iban', 'creditcard', 'svnr', 'taxid', 'email', 'url', 'ip', 'bic', 'birthdate', 'personal', 'phone',
+  'idnumber', 'address', 'names', 'kfz', 'date', 'amount', 'number'];
+
+const RISK = {
+  iban: 'hoch', creditcard: 'hoch', svnr: 'hoch', taxid: 'hoch', birthdate: 'hoch', hint: 'hoch',
+  email: 'mittel', phone: 'mittel', names: 'mittel', address: 'mittel', bic: 'mittel', idnumber: 'mittel', personal: 'mittel',
+  ip: 'mittel', kfz: 'mittel',
+  url: 'niedrig', date: 'niedrig', amount: 'niedrig', number: 'niedrig', image: 'niedrig',
+};
+
+export const SHORT = {
+  iban: 'IBAN', creditcard: 'Kreditkarte', svnr: 'Sozialversicherungsnr.', taxid: 'Steuer-ID / -Nr.', email: 'E-Mail',
+  url: 'Webadresse', ip: 'IP-Adresse', bic: 'BIC', birthdate: 'Geburtsdatum', phone: 'Telefon', idnumber: 'Nummer',
+  personal: 'Persönliche Angabe', address: 'Adresse', names: 'Name', kfz: 'Kfz-Kennzeichen', date: 'Datum',
+  amount: 'Betrag', number: 'Nummer', hint: 'Dein Hinweis', image: 'Bild',
+};
+
+function riskOf(cat, label) {
+  if (cat === 'idnumber') return ID_HIGH.test(label || '') ? 'hoch' : 'mittel';
+  if (cat === 'personal') return PERSONAL_HIGH.test(label || '') ? 'hoch' : 'mittel';
+  return RISK[cat] || 'mittel';
+}
+
+/** Schlüssel, unter dem gleiche Werte zusammengefasst werden. */
+export function valueKey(cat, text) {
+  if (cat === 'names') {
+    const last = normalize(text).split(' ').pop();
+    return `names|${last}`;
+  }
+  return `${cat}|${normalize(text).replace(/ /g, '')}`;
+}
+
+function overlapsAny(list, m) {
+  return list.some((o) => m.start < o.end && o.start < m.end);
+}
+
+/**
+ * Durchsucht alle Seiten nach möglicherweise kritischen Daten.
+ * Rückgabe: [{ key, cat, label, risk, value, variants, occurrences: [{page, start, end, text}] }]
+ */
+export function scanDocument(pages) {
+  const cands = [];
+  SCAN_ORDER.forEach((cat, prio) => {
+    for (const m of findMatches({ kind: 'category', cat }, pages)) cands.push({ ...m, cat, prio });
+  });
+  cands.sort((a, b) => a.prio - b.prio || (b.end - b.start) - (a.end - a.start));
+  const claimed = pages.map(() => []);
+  const groups = new Map();
+  for (const c of cands) {
+    if (!c.text.trim() || overlapsAny(claimed[c.page], c)) continue;
+    claimed[c.page].push(c);
+    const key = valueKey(c.cat, c.text);
+    if (!groups.has(key)) {
+      groups.set(key, { key, cat: c.cat, label: c.label || SHORT[c.cat], risk: riskOf(c.cat, c.label), occurrences: [] });
+    }
+    groups.get(key).occurrences.push({ page: c.page, start: c.start, end: c.end, text: c.text });
+  }
+  // „Mustermanns“ (Genitiv) zur Person „Mustermann“ legen
+  for (const [key, g] of groups) {
+    if (g.cat !== 'names' || !key.endsWith('s')) continue;
+    const base = groups.get(key.slice(0, -1));
+    if (base && base !== g) { base.occurrences.push(...g.occurrences); groups.delete(key); }
+  }
+  const out = [...groups.values()];
+  for (const g of out) {
+    g.occurrences.sort((a, b) => a.page - b.page || a.start - b.start);
+    const texts = [...new Set(g.occurrences.map((o) => o.text.replace(/\s+/g, ' ').trim()))];
+    g.value = texts.reduce((a, b) => (b.length > a.length ? b : a));
+    g.variants = texts.filter((t) => t !== g.value);
+  }
+  const order = { hoch: 0, mittel: 1, niedrig: 2 };
+  out.sort((a, b) => order[a.risk] - order[b.risk] || a.occurrences[0].page - b.occurrences[0].page || a.occurrences[0].start - b.occurrences[0].start);
+  return out;
+}
+
+// Wert hinter einer Bezeichnung wie „Versicherungsnummer: 12 345678 A 123“ oder „Aktenzeichen 4 O 123/24“
+const ID_LABEL = /(?<![\p{L}])((?:[\p{L}][\p{L}\-]*?(?:nummer|Nummer|-Nr\.?|-ID|-Id|kennung|Kennung|kennzeichen|Kennzeichen|zeichen|Zeichen|code|Code))|Nr\.|No\.|Az\.|ID|Ihr Zeichen|Unser Zeichen|Pass-?Nr\.?)(?![\p{L}])[ \t]*[:#.]?[ \t]*/gu;
+const ID_HIGH = /versicher|ausweis|pass|führerschein|patient|steuer|sozial|renten|kranken|personal|identifikation/i;
+const ID_SKIP = /^(?:telefon|tel|fax|handy|mobil|konto|iban|haus|seiten|blatt|zimmer|raum)/i;
+
+function findLabeledIds(text) {
+  const out = [];
+  for (const m of text.matchAll(ID_LABEL)) {
+    const label = m[1];
+    if (ID_SKIP.test(label)) continue;
+    let pos = m.index + m[0].length;
+    const lineEnd = text.indexOf('\n', pos) < 0 ? text.length : text.indexOf('\n', pos);
+    const rest = text.slice(pos, lineEnd);
+    // Werte-Tokens einsammeln: enthalten Ziffern oder sind kurze Großbuchstaben-Gruppen zwischen Ziffern
+    const toks = [...rest.matchAll(/\S+/g)];
+    let end = -1, digits = 0;
+    for (let i = 0; i < toks.length; i++) {
+      const t = toks[i][0].replace(/[,;)]+$/, '');
+      const gap = i ? toks[i].index - (toks[i - 1].index + toks[i - 1][0].length) : toks[i].index;
+      if (gap > 2) break;
+      const hasDigit = /\d/.test(t);
+      const shortCaps = /^[A-Z]{1,3}$/.test(t) && toks[i + 1] && /\d/.test(toks[i + 1][0]);
+      if (!/^[A-Za-z0-9\-\/.]+$/.test(t) || (!hasDigit && !shortCaps && i > 0) || (!hasDigit && !/^[A-Z0-9]/.test(t))) break;
+      if (!hasDigit && i === 0 && !shortCaps && !/^[A-Z]{1,4}[\-\/]/.test(t)) break;
+      digits += (t.match(/\d/g) || []).length;
+      end = toks[i].index + t.replace(/\.$/, '').length;
+      if (t.length !== toks[i][0].length) break;
+    }
+    if (end > 0 && digits >= 2) out.push({ start: pos, end: pos + end, label: label.replace(/[:.]$/, '') });
+  }
+  return out;
+}
+
+// Persönliche Angaben in Textform („Geburtsort: Hamburg“, „Diagnose: …“)
+const PERSONAL_LABELS = 'Geburtsort|Geburtsland|Staatsangehörigkeit|Nationalität|Familienstand|Konfession|Religion|Religionszugehörigkeit|Geschlecht|Diagnosen?|Befund|Krankenkasse|Krankenversicherung|Arbeitgeber(?:in)?|Beruf|Grad der Behinderung|Behinderung|Blutgruppe|Allergien|Allergie|Vorerkrankungen|Medikation|Medikamente|Steuerklasse|Kinder|Einkommen|Gehalt|Bruttogehalt|Nettogehalt';
+const PERSONAL_HIGH = /diagnos|befund|religion|konfession|behinderung|blutgruppe|allergie|vorerkrank|medika/i;
+function findPersonal(text) {
+  const rx = new RegExp(`(?<![\\p{L}])(${PERSONAL_LABELS})[ \\t]*:[ \\t]*([^\\n]{1,80}?)[ \\t]*(?=\\n|$|[ \\t]{3,}|[,;]|[ \\t]+[\\p{L}][\\p{L}\\-.]*[ \\t]*:)`, 'gud');
+  return [...text.matchAll(rx)].map((m) => ({ start: m.indices[2][0], end: m.indices[2][1], label: m[1] }));
+}
+
+/** Längere Ziffernfolgen, die sonst nirgends zugeordnet wurden (Vorgangs-, Kunden-, Policen-Nummern …). */
+function findLongNumbers(text) {
+  const out = [];
+  for (const m of text.matchAll(/(?<![\p{L}\p{N}])[A-Z]{0,3}\d(?:[\d\-\/]|[ .](?=\d))*\d(?![\p{L}\p{N}])/gu)) {
+    if ((m[0].match(/\d/g) || []).length >= 6) out.push({ start: m.index, end: m.index + m[0].length });
+  }
+  return out;
+}
 
 const PII = ['email', 'phone', 'iban', 'bic', 'birthdate', 'address', 'names', 'taxid', 'svnr', 'creditcard', 'ip'];
 const SAY_ALL_PII = /\b(personenbezogen\w*|persoenlich\w*|sensib\w*|vertraulich\w*|alle daten|kontaktdaten)\b/;

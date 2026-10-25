@@ -1,107 +1,109 @@
-# PDF Schwärzen
+# PDF Datenschutz
 
-Web-App, mit der du Daten **per Sprache** aus PDF-Dokumenten entfernst, und zwar sicher und **komplett lokal** auf
-deinem Gerät (iPhone, iPad, Mac, PC). Es gibt keinen Server, keinen Upload und keine Installation über den App Store.
+Web-App für iPhone, iPad und Computer: Sie findet in PDF-Dokumenten **automatisch** Daten, die kritisch sein könnten,
+bewertet sie und zeigt sie in einer Liste. Pro Fund entscheidest du: **schwärzen**, **ersetzen** (Pseudonym) oder
+**behalten**. Alles läuft **lokal auf dem Gerät**. Es gibt keinen Server, keinen Upload und keine Installation über den App Store.
 
-1. **PDF öffnen.** Das Dokument wird angezeigt.
-2. **Mikrofon antippen und sprechen**, z. B. *„Entferne alle E-Mail-Adressen und den Namen Max Mustermann“*.
-   Die Fundstellen werden gelb markiert und als Liste angezeigt, in der du sie an- oder abwählen kannst.
-3. **„Schwärzen“** sagen oder antippen. Das Ergebnis erscheint direkt, und mit *Original | Ergebnis* kannst du vergleichen.
-4. **Speichern.** Standardmäßig unter demselben Dateinamen, im Feld darüber kannst du einen anderen Namen eingeben.
+**Adresse:** https://jcharz.github.io/pdf-datenschutz/ (in Safari öffnen → Teilen → *Zum Home-Bildschirm*)
 
-## Sprachbefehle (Beispiele)
+## Ablauf
 
-| Gesagt | Wirkung |
+1. **PDF öffnen.** Die App liest den Text aller Seiten und sucht nach kritischen Daten.
+2. **Liste prüfen.** Jeder Fund zeigt den *echten Wert*, der geändert würde (z. B. `12 150380 M 123`, nicht nur
+   „Versicherungsnummer“), dazu die Bewertung, die Seite und wie oft er vorkommt.
+   Ein Tipp auf den Wert springt zur Stelle im Dokument.
+3. **Pro Fund wählen:** *Schwärzen* · *Ersetzen* · *Behalten*. Bei *Ersetzen* steht der Ersatzwert darunter
+   (🎲 = neuen erzeugen).
+4. **Hinweise geben** (tippen oder über das 🎤 der iPhone-Tastatur diktieren):
+   „auch Projekt Alpha“, „den Namen Erika Muster“, „alle Datumsangaben“, „behalte die Beträge“.
+5. **Anwenden.** Das Ergebnis erscheint sofort. Mit **Vorher | Nachher** vergleichst du an genau derselben Stelle.
+6. **Speichern.** Standardmäßig unter demselben Namen, ein anderer Name lässt sich im Speichern-Dialog eingeben.
+
+## Was erkannt wird
+
+| Risiko | Beispiele |
 | --- | --- |
-| „Entferne alle E-Mail-Adressen und Telefonnummern“ | Kategorien |
-| „Lösche die IBAN und die BIC“ / „die Bankverbindung“ | Kontodaten (IBAN mit Prüfziffer) |
-| „Schwärze den Namen Erika Musterfrau“ | Name, einzelne Namensteile, Genitiv („Musterfraus“), ähnliche Schreibweisen |
-| „Entferne die Kundennummer“ | den **Wert** hinter „Kundennummer:“ bzw. „Kunden-Nr.“ |
-| „Entferne die Adressen“, „Geburtsdaten“, „Geldbeträge“, „Datumsangaben“ | Kategorien |
-| „Entferne alle Namen“ | Namen nach Anrede („Herr …“), „Name: …“ und Grußformel, danach überall im Dokument |
-| „Alle personenbezogenen Daten“ | alle Kategorien für personenbezogene Daten |
-| „Entferne das Wort ‚Projekt Alpha‘ auf Seite 2“ | genauer Begriff, optional nur auf bestimmten Seiten |
-| „Schwärzen“ / „Anwenden“ · „Rückgängig“ · „Zurücksetzen“ | Steuerung |
-| „Speichern“ · „Speichern unter Vertrag anonym“ | Speichern |
+| **hoch** (vorausgewählt) | IBAN (mit Prüfziffer), Kreditkarte (Luhn), Sozialversicherungsnr., Steuer-ID, Geburtsdatum, Gesundheits- und Religionsangaben („Diagnose: …“), Nummern hinter Bezeichnungen wie „Versicherungs-/Ausweis-/Patientennummer“, deine Hinweise |
+| **mittel** (vorausgewählt) | Namen (Anrede, „Name:“, Grußformel, bekannter Vorname + Nachname, danach überall im Dokument inkl. Genitiv), Adressen, E-Mail, Telefon, BIC, Kunden-/Vertrags-/Rechnungsnummern, Aktenzeichen, Kfz-Kennzeichen, Geburtsort, Arbeitgeber … |
+| **niedrig** (angezeigt, nicht vorausgewählt) | Datumsangaben, Beträge, Webadressen, sonstige lange Nummern, Bilder (mögliche Unterschrift/Foto/Stempel) |
 
-Außerdem kannst du Treffer im Dokument antippen, um sie an- oder abzuwählen. Mit **„Bereich markieren“** schwärzt du
-Flächen von Hand, etwa Unterschriften, Fotos oder eingescannte Seiten ohne Textebene.
+Die Erkennung ist bewusst großzügig: Lieber ein Fund zu viel in der Liste als einer zu wenig. Eingescannte Seiten
+(nur Bild, kein Text) werden gemeldet; dort markierst du Bereiche mit **▭** von Hand.
+
+## Ersetzen (Pseudonymisieren) und die Pseudonym-Tabelle
+
+- Ersatzwerte haben **dieselbe Struktur** wie das Original: Eine IBAN bekommt eine andere, aber gültige IBAN
+  (gleiches Land, gleiche Länge, korrekte Prüfziffer). Ebenso Sozialversicherungsnummer und Steuer-ID mit Prüfziffer,
+  Kreditkarte (Luhn) und Kundennummern mit gleichem Muster (`KV-4711/0815` → `MS-7267/9725`). Datumswerte bleiben im
+  selben Format, Namen werden pro Bestandteil ersetzt („Max Mustermann“ → „Jonas Becker“, „Mustermanns“ → „Beckers“,
+  `max.mustermann@…` → `jonas.becker@…`).
+- Beim Anwenden merkt sich die App die Ersatzwerte in einer **Tabelle auf dem Gerät**. Taucht derselbe Originalwert
+  in einem späteren Dokument wieder auf, wird automatisch **derselbe Ersatzwert** vorgeschlagen (Markierung „bekannt“).
+- **Die Tabelle enthält keine Originalwerte.** Gespeichert werden nur ein nicht umkehrbarer Fingerabdruck
+  (SHA-256 mit geräteeigenem Zufallswert), der Ersatzwert und ein gekürzter Hinweis wie `DE…00`.
+- Unter ⚙︎ kannst du die Tabelle ansehen, einzelne Einträge löschen, sie als Datei **sichern** und **wiederherstellen**.
+
+## Viewer: Seiten und Lupe
+
+- Immer eine Seite. **Wischen ← →** blättert.
+- **🔍 Lupe** zeigt die Seite doppelt so groß in vier Vierteln: oben links → oben rechts → unten links → unten rechts → nächste Seite.
+  Wischen ← → geht in dieser Reihenfolge, ↑ ↓ wechselt zwischen oben und unten. Das Lupen-Symbol zeigt, welches Viertel gerade zu sehen ist.
+- **Doppeltippen** vergrößert genau die getippte Stelle.
+- Die Bedienelemente sitzen links unten, damit man die App gut mit dem linken Daumen bedienen kann.
 
 ## Warum die Daten wirklich weg sind
 
-Ein schwarzer Balken über dem Text reicht nicht, denn der Text bliebe darunter kopierbar. Die App geht deshalb so vor:
+- **Seiten mit Änderungen werden komplett neu als Bild aufgebaut.** Schwärzungen und Ersatzwerte werden direkt in die
+  Pixel gemalt, der ursprüngliche Text dieser Seite existiert danach nicht mehr. Der übrige Text und die Ersatzwerte
+  werden als unsichtbare Textebene wieder darübergelegt, damit das PDF durchsuchbar bleibt.
+- **Das Ergebnis ist ein komplett neues PDF** ohne Metadaten (Titel, Autor, XMP), Kommentare, Formulare, Lesezeichen,
+  Dateianhänge, JavaScript und Seitenaktionen.
+- **Versteckter Text** (weiße oder winzige Schrift, Formularwerte, Kommentare) wird mit durchsucht. Unsichtbarer Text
+  wird unsichtbar entfernt, damit kein verräterischer Balken entsteht.
+- **Automatische Prüfung:** Das Ergebnis wird erneut eingelesen und vollständig nach den Originalwerten durchsucht:
+  Text, Metadaten, Lesezeichen, Anhänge und alle entpackten Datenströme.
 
-- **Seiten mit Schwärzungen werden komplett neu als Bild aufgebaut.** Die Balken werden direkt in die Pixel gemalt,
-  der ursprüngliche Text, die Schriften und die Inhaltsströme dieser Seite gibt es danach nicht mehr. Der restliche,
-  *nicht* geschwärzte Text wird als unsichtbare Textebene wieder darübergelegt, damit er durchsuchbar und kopierbar bleibt.
-- **Das Ergebnis ist ein komplett neues PDF.** Seiten ohne Treffer werden übernommen, aber ohne Metadaten (Titel,
-  Autor, XMP), Kommentare, Formulare, Lesezeichen, Dateianhänge, JavaScript und Seitenaktionen. Seiten mit Formularfeldern
-  oder Kommentaren werden flachgerechnet (als Bild).
-- **Es wird auch versteckter Text gefunden:** weiße oder winzige Schrift, Formularfeldwerte und Kommentartexte.
-- **Automatische Prüfung:** Nach dem Schwärzen wird das Ergebnis erneut eingelesen. Sämtlicher Text, Metadaten,
-  Lesezeichen, Anhänge und alle entpackten Datenströme (auch hex-kodierte Strings) werden nach den entfernten Inhalten
-  durchsucht. Das Ergebnis siehst du unter dem Dokument („✓ … nicht mehr auffindbar“).
-- In den Einstellungen gibt es die Option **„Alle Seiten als Bild neu aufbauen“** für maximale Sicherheit.
+## Datenschutz
 
-## Warum alles lokal bleibt
+- Statische Webseite ohne Server-Logik. PDFs bleiben im Arbeitsspeicher des Browsers.
+- Eine Content-Security-Policy verbietet der Seite **jede Verbindung nach außen**. Der Browser-Test prüft das zusätzlich.
+- Keine Spracherkennung in der App. Zum Diktieren dient die Tastatur des iPhones (Siri-Diktat). Auf neueren iPhones
+  läuft das Diktat für Deutsch laut Apple auf dem Gerät. Wer ganz sichergehen will, tippt den Hinweis.
+- Bibliotheken liegen im Ordner `vendor/`, es wird kein fremdes CDN verwendet. Nach dem ersten Aufruf funktioniert die App offline.
 
-- Die App ist eine statische Webseite ohne Server-Logik. PDF und Audio bleiben im Arbeitsspeicher des Browsers.
-- **Spracherkennung:** [Whisper](https://github.com/openai/whisper) läuft über
-  [Transformers.js](https://github.com/huggingface/transformers.js) als WebAssembly direkt im Browser. Die eingebaute
-  Spracherkennung des Browsers (Web Speech API) wird bewusst **nicht** verwendet, weil sie das Audio an Apple- bzw.
-  Google-Server schickt.
-- Das Sprachmodell (ca. 40/80/250 MB, einstellbar) wird **einmalig** von huggingface.co geladen und bleibt im
-  Gerätespeicher. Danach funktioniert alles offline (Flugmodus-Test). Wer auch diesen Download vermeiden will, legt die
-  Modelldateien unter `models/Xenova/whisper-base/` ab; die App nimmt dann zuerst diese.
-- Eine Content-Security-Policy im Browser erlaubt der Seite nur Verbindungen zur eigenen Adresse und zum Modell-Download.
-- Alle Bibliotheken liegen im Ordner `vendor/`, es wird kein fremdes CDN verwendet.
-- Die **Befehlserkennung** ist regelbasiert und läuft lokal (`js/detect.js`): Schlüsselwörter, Muster für IBAN
-  (mit Prüfziffer), Kreditkarten (Luhn), Telefonnummern, Adressen usw. sowie die Kölner Phonetik für ähnlich klingende Namen.
+## Veröffentlichung
 
-## Auf dem iPhone nutzen
-
-Die App muss über **HTTPS** erreichbar sein, sonst gibt iOS das Mikrofon nicht frei. Am einfachsten geht das mit GitHub Pages:
-
-1. Im Repository unter *Settings → Pages → Build and deployment* als Quelle **„GitHub Actions“** wählen.
-2. Nach dem nächsten Push auf `main` baut der Workflow `.github/workflows/pages.yml` die Seite.
-3. Die Adresse in Safari öffnen, dann *Teilen → Zum Home-Bildschirm*. Die App startet danach wie eine normale App.
-4. Beim ersten Tippen aufs Mikrofon wird das Sprachmodell geladen (am besten im WLAN).
+Jeder Push auf `main` veröffentlicht die App über GitHub Pages (`.github/workflows/pages.yml`, inklusive Tests).
 
 **Speichern auf dem iPhone:** iOS erlaubt Webseiten nicht, eine Datei direkt zu überschreiben. „Speichern“ öffnet
-deshalb das Teilen-Menü. Dort *„In Dateien sichern“* wählen, denselben Ordner nehmen und das Ersetzen bestätigen.
-Am Desktop (Chrome/Edge) wird die geöffnete Datei direkt überschrieben.
-
-Jeder andere statische Webserver mit HTTPS funktioniert genauso, denn es gibt keinen Build-Schritt.
+deshalb das Teilen-Menü. Dort *„In Dateien sichern“* wählen und für denselben Namen den Ordner des Originals nehmen
+und „Ersetzen“ bestätigen. Am Computer (Chrome/Edge) wird die geöffnete Datei direkt überschrieben.
 
 ## Entwicklung
 
 ```sh
 npm start              # lokaler Server auf http://localhost:8080
-npm test               # Tests der Befehlserkennung (Node, keine Abhängigkeiten)
-npm run test:e2e       # End-to-End-Test im Browser (benötigt Playwright + Chromium)
+npm test               # Erkennung, Ersatzwerte, Tabelle (Node, keine Abhängigkeiten)
+npm run test:e2e       # kompletter Ablauf im Browser (Playwright + Chromium)
 ```
-
-Der End-to-End-Test erzeugt ein PDF mit Name, E-Mail, Telefonnummer, IBAN, Kundennummer, unsichtbarem Text,
-Formularfeld, Metadaten und Dateianhang, schwärzt es über die Oberfläche und prüft das Ergebnis unabhängig.
 
 | Datei | Aufgabe |
 | --- | --- |
-| `js/app.js` | Oberfläche, Ablauf, Speichern |
-| `js/detect.js` | Sprachbefehle verstehen, Treffer finden (lokal, regelbasiert) |
-| `js/pdfmodel.js` | Text und Zeichenpositionen einer Seite |
-| `js/redact.js` | Sicheres Schwärzen und Prüfung des Ergebnisses |
-| `js/viewer.js` | PDF-Anzeige mit Markierungen |
-| `js/speech.js`, `js/whisper-worker.js` | Aufnahme und lokale Spracherkennung |
+| `js/app.js` | Oberfläche und Ablauf |
+| `js/detect.js` | Automatische Erkennung, Bewertung, Hinweise verstehen |
+| `js/data.js` | Vornamen, Nachnamen, Straßen, Orte (Erkennung und Ersatzwerte) |
+| `js/pseudo.js` | Ersatzwerte mit Prüfziffern, Pseudonym-Tabelle |
+| `js/pdfmodel.js` | Text, Zeichenpositionen und Bilder einer Seite |
+| `js/redact.js` | Schwärzen/Ersetzen und Prüfung des Ergebnisses |
+| `js/viewer.js` | Seitenansicht mit Wischen und Lupe |
 | `sw.js` | Offline-Fähigkeit |
 
 ## Grenzen
 
-- **Eingescannte PDFs** (nur Bilder, kein Text) können nicht automatisch durchsucht werden. Dafür gibt es „Bereich markieren“.
-- Text, der in Bildern steckt (z. B. ein Logo mit Adresse), wird nicht automatisch erkannt.
-- Geschwärzte Seiten sind danach Bilder mit unsichtbarer Textebene. Die Dateigröße steigt etwas, die Optik bleibt gleich.
-- Die Erkennung von „allen Namen“ ohne konkrete Vorgabe stützt sich auf Anrede, „Name:“ und Grußformel. Für wichtige
-  Dokumente Namen besser konkret nennen und die Trefferliste kontrollieren.
-- Benötigt iOS 16.4 oder neuer.
+- Die Erkennung arbeitet mit Regeln, Mustern, Prüfziffern und Namenslisten, nicht mit einer KI. Seltene Namen ohne
+  Anrede oder Bezeichnung können durchrutschen. In dem Fall hilft ein Hinweis („den Namen …“).
+- Text in Bildern und eingescannten Seiten wird nicht gelesen. Dafür gibt es ▭.
+- Ersatztext wird in einer Standardschrift eingesetzt. Er passt sich Größe, Farbe und Breite an, sieht aber nicht immer exakt aus wie die Originalschrift.
+- Geänderte Seiten sind danach Bilder mit unsichtbarer Textebene. Die Datei wird etwas größer.
 
-Bibliotheken: [pdf.js](https://github.com/mozilla/pdf.js) (Apache-2.0), [pdf-lib](https://github.com/Hopding/pdf-lib) (MIT),
-[Transformers.js](https://github.com/huggingface/transformers.js) mit ONNX Runtime Web (Apache-2.0 / MIT). Die Lizenzen liegen in `vendor/`.
+Bibliotheken: [pdf.js](https://github.com/mozilla/pdf.js) (Apache-2.0) und [pdf-lib](https://github.com/Hopding/pdf-lib) (MIT). Die Lizenzen liegen in `vendor/`.

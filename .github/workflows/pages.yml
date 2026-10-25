@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Unit-Tests
-        run: node --test tests/detect.test.mjs
+        run: node --test tests/detect.test.mjs tests/scan.test.mjs
       - name: Seite zusammenstellen
         run: |
           mkdir _site

@@ -1,13 +1,11 @@
 // Service Worker: hält die App-Dateien auf dem Gerät, damit sie offline funktioniert.
 // Dokumente werden hier nie gespeichert – sie existieren nur im Arbeitsspeicher der Seite.
-const VERSION = 'v1';
+const VERSION = 'v2';
 const CACHE = `pdf-redact-${VERSION}`;
 const APP_FILES = [
   './', 'index.html', 'css/app.css', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-180.png', 'icons/icon-512.png',
-  'js/app.js', 'js/detect.js', 'js/pdfmodel.js', 'js/redact.js', 'js/viewer.js', 'js/speech.js', 'js/whisper-worker.js',
+  'js/app.js', 'js/detect.js', 'js/data.js', 'js/pseudo.js', 'js/pdfmodel.js', 'js/redact.js', 'js/viewer.js',
   'vendor/pdf-lib/pdf-lib.min.js', 'vendor/pdfjs/pdf.min.mjs', 'vendor/pdfjs/pdf.worker.min.mjs',
-  'vendor/transformers/transformers.min.js', 'vendor/transformers/ort-wasm-simd-threaded.jsep.mjs',
-  'vendor/transformers/ort-wasm-simd-threaded.jsep.wasm',
 ];
 
 self.addEventListener('install', (e) => {
@@ -24,12 +22,12 @@ self.addEventListener('activate', (e) => {
 
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
-  if (e.request.method !== 'GET' || url.origin !== location.origin) return; // Modell-Downloads: eigener Cache von transformers.js
+  if (e.request.method !== 'GET' || url.origin !== location.origin) return;
   // Erst Netz (für Updates), sonst Gerätespeicher – so läuft die App auch offline.
   e.respondWith(
     fetch(e.request)
       .then((res) => {
-        if (res.ok && !url.pathname.includes('/models/')) {
+        if (res.ok) {
           const copy = res.clone();
           caches.open(CACHE).then((c) => c.put(e.request, copy));
         }
