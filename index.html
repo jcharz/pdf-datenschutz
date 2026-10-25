@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <!-- Datenschutz per Browser erzwungen: Netzwerkzugriffe nur zur eigenen Seite und zum Laden des Sprachmodells. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self' https://huggingface.co https://*.huggingface.co https://*.hf.co; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; media-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <meta name="theme-color" content="#111827">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="PDF Schwärzen">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="stylesheet" href="css/app.css">
+  <title>PDF Schwärzen</title>
+</head>
+<body>
+  <header class="topbar">
+    <button id="btnOpen" class="btn primary" type="button">PDF öffnen</button>
+    <div class="filename" id="fileName">Kein Dokument</div>
+    <button id="btnSettings" class="btn icon" type="button" aria-label="Einstellungen">⚙︎</button>
+    <input id="fileInput" type="file" accept="application/pdf,.pdf" hidden>
+  </header>
+
+  <nav class="viewbar" id="viewBar" hidden>
+    <div class="seg" role="tablist">
+      <button id="tabOriginal" class="active" type="button" role="tab">Original</button>
+      <button id="tabResult" type="button" role="tab" disabled>Ergebnis</button>
+    </div>
+    <button id="btnMark" class="btn small" type="button" aria-pressed="false">▭ Bereich markieren</button>
+  </nav>
+
+  <main class="viewers">
+    <section id="empty" class="empty">
+      <div class="lock">🔒</div>
+      <h1>PDF-Daten sicher entfernen</h1>
+      <p>Öffne ein PDF und sag z.&nbsp;B. <em>„Entferne alle E-Mail-Adressen und den Namen Max Mustermann“</em>.</p>
+      <p class="small">Alles passiert auf diesem Gerät: Das Dokument und deine Sprache werden nie hochgeladen.</p>
+      <button id="btnOpen2" class="btn primary big" type="button">PDF öffnen</button>
+    </section>
+    <div id="viewOriginal" class="viewer" hidden></div>
+    <div id="viewResult" class="viewer" hidden></div>
+  </main>
+
+  <section class="sheet" id="sheet" hidden>
+    <div class="status" id="status" aria-live="polite"></div>
+    <div class="command">
+      <button id="btnMic" class="mic" type="button" aria-label="Sprechen">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-2.08A7 7 0 0 0 19 12h-2Z"/></svg>
+      </button>
+      <form id="cmdForm" class="cmdform" autocomplete="off">
+        <input id="cmdInput" type="text" enterkeyhint="send" placeholder="Sprechen oder tippen: „Entferne die IBAN“" autocapitalize="sentences">
+        <button class="btn" type="submit" aria-label="Ausführen">➤</button>
+      </form>
+    </div>
+
+    <div class="actions">
+      <button id="btnUndo" class="btn" type="button" disabled>↶ Rückgängig</button>
+      <button id="btnApply" class="btn danger" type="button" disabled>■ Schwärzen</button>
+    </div>
+    <div class="savebar" id="saveBar" hidden>
+      <div class="verify" id="verify"></div>
+      <label class="savename">Dateiname
+        <input id="saveName" type="text" autocapitalize="off" spellcheck="false">
+      </label>
+      <button id="btnSave" class="btn primary" type="button">Speichern</button>
+    </div>
+
+    <div class="rules" id="rules"></div>
+
+    <details class="help">
+      <summary>Beispiele für Sprachbefehle</summary>
+      <ul>
+        <li>„Entferne alle E-Mail-Adressen und Telefonnummern“</li>
+        <li>„Schwärze den Namen Erika Musterfrau“</li>
+        <li>„Lösche die IBAN und die BIC“ · „die Bankverbindung“</li>
+        <li>„Entferne die Kundennummer“ (schwärzt den Wert dahinter)</li>
+        <li>„Entferne die Adressen“ · „Geburtsdaten“ · „Geldbeträge“</li>
+        <li>„Entferne das Wort ‚Projekt Alpha‘ auf Seite 2“</li>
+        <li>„Alle personenbezogenen Daten“</li>
+        <li>„Schwärzen“ / „Anwenden“ · „Rückgängig“ · „Zurücksetzen“</li>
+        <li>„Speichern“ · „Speichern unter Vertrag anonym“</li>
+      </ul>
+      <p>Tippe auf einen Treffer, um ihn an- oder abzuwählen. Mit „Bereich markieren“ kannst du zusätzlich Flächen von Hand schwärzen (z.&nbsp;B. Unterschriften, Fotos, eingescannte Seiten).</p>
+    </details>
+  </section>
+
+  <dialog id="settings">
+    <form method="dialog">
+      <h2>Einstellungen</h2>
+      <label>Spracherkennung (lokales Modell)
+        <select id="setModel">
+          <option value="Xenova/whisper-tiny">Klein – schnell, ca. 40 MB</option>
+          <option value="Xenova/whisper-base" selected>Mittel – empfohlen, ca. 80 MB</option>
+          <option value="Xenova/whisper-small">Groß – genauer, ca. 250 MB</option>
+        </select>
+      </label>
+      <label>Auflösung geschwärzter Seiten
+        <select id="setDpi">
+          <option value="150">150 dpi – kleine Datei</option>
+          <option value="200" selected>200 dpi – empfohlen</option>
+          <option value="300">300 dpi – sehr scharf</option>
+        </select>
+      </label>
+      <label class="check"><input id="setRasterAll" type="checkbox"> Alle Seiten als Bild neu aufbauen (maximale Sicherheit, Text nirgends mehr markierbar)</label>
+      <p class="small">Das Sprachmodell wird einmalig aus dem Internet geladen und danach offline aus dem Gerätespeicher verwendet. Deine Aufnahmen und Dokumente werden nie übertragen.</p>
+      <div class="row">
+        <button id="btnClearModel" class="btn" type="button">Sprachmodell vom Gerät löschen</button>
+        <button class="btn primary" value="ok">Fertig</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <script src="vendor/pdf-lib/pdf-lib.min.js"></script>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

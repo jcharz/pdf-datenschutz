@@ -1,0 +1,10 @@
+{
+  "name": "pdf-schwaerzen",
+  "private": true,
+  "description": "PDF-Daten per Sprache sicher entfernen – komplett lokal im Browser",
+  "scripts": {
+    "start": "python3 -m http.server 8080",
+    "test": "node --test tests/detect.test.mjs",
+    "test:e2e": "node tests/e2e.cjs"
+  }
+}
