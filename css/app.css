@@ -97,6 +97,9 @@ polygon.hit.replace { fill: rgba(79, 70, 229, 0.28); stroke: #4f46e5; }
 polygon.hit.keep { fill: rgba(217, 119, 6, 0.08); stroke: #d97706; stroke-dasharray: 3 2; }
 polygon.hit.flash { animation: flash 1.2s ease-out 2; }
 @keyframes flash { 0%, 100% { stroke-width: 0.8; } 40% { stroke: #ef4444; stroke-width: 4; } }
+g.tag { pointer-events: none; }
+g.tag rect { fill: #4f46e5; opacity: 0.92; }
+g.tag text { fill: #fff; font-family: -apple-system, "Segoe UI", sans-serif; font-weight: 600; }
 rect.drawing { fill: rgba(79, 70, 229, 0.2); stroke: #4f46e5; stroke-width: 1; vector-effect: non-scaling-stroke; }
 
 /* Startbildschirm */
@@ -189,6 +192,26 @@ rect.drawing { fill: rgba(79, 70, 229, 0.2); stroke: #4f46e5; stroke-width: 1; v
 }
 .finding.r-hoch { border-left-color: var(--high); }
 .finding.r-mittel { border-left-color: var(--mid); }
+.finding.r-sender { border-left-color: var(--line); background: var(--panel-2); }
+.r-sender .risk { color: var(--muted); }
+.finding.block .value { white-space: pre-line; font-size: 16px; line-height: 1.35; }
+.fake code { white-space: pre-line; }
+.fake.off { opacity: 0.55; }
+.fake.off code { color: var(--muted); }
+.fake .arrow { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap; }
+.owner-switch { border: 0; background: none; color: var(--muted); font-size: 13px; padding: 8px 0 0; cursor: pointer; }
+.section { list-style: none; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding: 10px 2px 0; display: flex; gap: 8px; align-items: baseline; }
+.section .hint { font-weight: 500; text-transform: none; letter-spacing: 0; }
+.offer { border: 1px solid var(--primary); background: var(--primary-soft); border-radius: var(--radius); padding: 12px; list-style: none; }
+.offer b { display: block; margin-bottom: 4px; }
+.offer .row { display: flex; gap: 8px; margin-top: 10px; }
+.offer .btn { flex: 1; }
+.report-map { margin-top: 8px; font-size: 13px; }
+.report-map summary { cursor: pointer; color: var(--primary); font-weight: 600; }
+.report-map table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+.report-map td { padding: 4px 4px; border-top: 1px solid var(--line); vertical-align: top; white-space: pre-line; word-break: break-word; }
+.report-map td.to { color: var(--replace); font-weight: 600; }
+.verify .actions-row { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
 .finding.focus { box-shadow: 0 0 0 3px var(--primary-soft), 0 0 0 4px var(--primary); }
 .finding .meta { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
 .finding .meta .risk { font-weight: 700; text-transform: uppercase; font-size: 11px; letter-spacing: 0.04em; }

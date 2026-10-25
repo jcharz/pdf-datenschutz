@@ -114,6 +114,7 @@
         </select>
       </label>
       <label class="check"><input id="setLow" type="checkbox"> Auch Funde mit niedrigem Risiko (Datum, Betrag, Nummern) vorauswählen</label>
+      <label class="check"><input id="setSender" type="checkbox"> Auch Absenderdaten (Briefkopf, Fußzeile, Ansprechpartner) vorauswählen</label>
       <label>Auflösung geänderter Seiten
         <select id="setDpi">
           <option value="150">150 dpi – kleine Datei</option>
@@ -125,6 +126,10 @@
       <h3>Pseudonym-Tabelle</h3>
       <p class="small">Gespeichert nur auf diesem Gerät. Originalwerte werden nicht abgelegt, nur ein nicht umkehrbarer Fingerabdruck – daneben der Ersatzwert und ein gekürzter Hinweis.</p>
       <div class="tablebox" id="tableBox"></div>
+      <h3>Bearbeitungsschablonen</h3>
+      <p class="small">Merkt sich, wie ein Formular bearbeitet wurde, und bietet die Schritte beim nächsten Dokument derselben Art an. Gespeichert werden keine Inhalte – nur Fingerabdrücke der festen Formulartexte und deine Entscheidungen.</p>
+      <div class="tablebox" id="templateBox"></div>
+      <p class="small">Sichern/Wiederherstellen umfasst Pseudonym-Tabelle und Schablonen.</p>
       <div class="row">
         <button id="btnExport" class="btn small" type="button">Sichern (Datei)</button>
         <button id="btnImport" class="btn small" type="button">Wiederherstellen</button>

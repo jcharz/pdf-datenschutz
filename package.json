@@ -5,6 +5,7 @@
   "scripts": {
     "start": "python3 -m http.server 8080",
     "test": "node --test tests/detect.test.mjs tests/scan.test.mjs",
-    "test:e2e": "node tests/e2e.cjs"
+    "test:e2e": "node tests/e2e.cjs",
+    "test:samples": "node tests/evaluate.cjs"
   }
 }

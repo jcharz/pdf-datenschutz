@@ -105,3 +105,23 @@ test('Namen werden pro Bestandteil ersetzt (Genitiv, E-Mail)', async () => {
   assert.ok(mail.fake.startsWith(`${ascii(name.fake.split(' ')[0])}.${ascii(last)}@`), mail.fake);
   assert.ok(!mail.fake.includes('firma-xy'), 'Firmen-Domain wird ersetzt');
 });
+
+test('Kennnummern mit Leerzeichen, Buchstaben und Schrägstrichen werden vollständig erkannt', async () => {
+  const { scanDocument: scan } = await import('../js/detect.js');
+  const t = 'Kundennummer: 123456 B 7890\nKundennummer: KD-2024 / 0815\nKundennummer:\n4711 A 12\nAktenzeichen 4 O 123/24';
+  const values = scan([t]).map((f) => f.value);
+  for (const v of ['123456 B 7890', 'KD-2024 / 0815', '4711 A 12', '4 O 123/24']) assert.ok(values.includes(v), v);
+});
+
+test('Steuer-ID mit Zusatz in der Beschriftung und ohne Beschriftung (Prüfziffer)', async () => {
+  const { scanDocument: scan } = await import('../js/detect.js');
+  const values = scan(['Steuer-ID Ehemann: 86 095 742 719\nIrgendwo steht 47 036 892 816 im Text.']).map((f) => `${f.cat}:${f.value}`);
+  assert.ok(values.includes('taxid:86 095 742 719'));
+  assert.ok(values.includes('taxid:47 036 892 816'));
+});
+
+test('Mehrzeilige Angaben unter einer Beschriftung', async () => {
+  const { scanDocument: scan } = await import('../js/detect.js');
+  const f = scan(['Diagnosen:\nI10.90 Essentielle Hypertonie\nE78.0 Hypercholesterinämie\n\nText']).find((x) => x.cat === 'personal');
+  assert.match(f.value, /Hypertonie.*Hypercholesterinämie/s);
+});

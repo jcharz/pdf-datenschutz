@@ -230,6 +230,32 @@ export class PageViewer {
       if (s.id) poly.dataset.id = s.id;
       this.svg.append(poly);
     }
+    // Schilder mit Ersatzwerten zuletzt, damit sie über allen Markierungen liegen
+    for (const s of this.shapes) if (s.tag && s.page === this.index) this.svg.append(this.makeTag(s));
+  }
+
+  /** Kleines Schild mit dem Ersatzwert über der markierten Stelle. */
+  makeTag(s) {
+    const pts = s.quad.map(([x, y]) => this.vp1.convertToViewportPoint(x, y));
+    const x = Math.min(...pts.map((p) => p[0]));
+    const top = Math.min(...pts.map((p) => p[1]));
+    const h = Math.max(...pts.map((p) => p[1])) - top;
+    const fs = Math.max(4, Math.min(9, h * 0.55));
+    const g = document.createElementNS(SVG, 'g');
+    g.setAttribute('class', 'tag');
+    const text = document.createElementNS(SVG, 'text');
+    text.setAttribute('x', x + fs * 0.3);
+    text.setAttribute('y', top - fs * 0.35);
+    text.setAttribute('font-size', fs);
+    text.textContent = `→ ${s.tag}`;
+    const rect = document.createElementNS(SVG, 'rect');
+    rect.setAttribute('x', x);
+    rect.setAttribute('y', top - fs * 1.3);
+    rect.setAttribute('height', fs * 1.25);
+    rect.setAttribute('width', (s.tag.length + 2) * fs * 0.56 + fs * 0.6);
+    rect.setAttribute('rx', fs * 0.3);
+    g.append(rect, text);
+    return g;
   }
 
   setMarkMode(on) {

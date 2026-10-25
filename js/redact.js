@@ -80,6 +80,7 @@ function paintReplacement(ctx, vp, rep) {
   const textW = ctx.measureText(rep.text).width;
   const maxW = avail * vp.scale * 1.08;
   if (textW > maxW) ctx.scale(Math.max(0.6, maxW / textW), 1);
+  else if (textW < avail * vp.scale * 0.92) ctx.scale(Math.min(1.12, (avail * vp.scale) / textW), 1); // Lücke verkleinern
   ctx.fillStyle = fg;
   ctx.textBaseline = 'alphabetic';
   ctx.fillText(rep.text, 0, 0);

@@ -98,7 +98,7 @@ function rawText(buf) {
 
   const findings = await page.evaluate(() => window.__pdfPrivacy.state.findings.map((f) => ({ cat: f.cat, label: f.label, value: f.value, risk: f.risk, action: f.action, fake: f.fake })));
   console.log(findings.map((f) => `  ${f.risk.padEnd(7)} ${f.label.padEnd(22)} ${f.value}  [${f.action}]  → ${f.fake}`).join('\n'));
-  const has = (v) => findings.some((f) => f.value === v);
+  const has = (v) => findings.some((f) => f.value === v || (f.cat === 'block' && f.value.includes(v)));
   for (const v of ['Max Mustermann', IBAN, '12 150380 M 123', 'KV-4711/0815', 'max.mustermann@example.de', '0221 / 123 456-78', 'Musterstraße 12a', '50667 Köln', 'Diabetes']) {
     check(has(v), `Automatisch erkannt: ${v}`);
   }

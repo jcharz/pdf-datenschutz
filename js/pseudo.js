@@ -5,6 +5,7 @@
 // SHA-256-Fingerabdruck (nicht umkehrbar), der Ersatzwert und ein maskierter Hinweis („DE89 … 00“).
 
 import { normalize } from './detect.js';
+import { ORG } from './structure.js';
 import {
   FIRST_NAMES, FEMALE, FIRST_NAMES_F, FIRST_NAMES_M, LAST_NAMES, STREETS, CITIES, PUBLIC_MAIL_DOMAINS, FAKE_MAIL_DOMAINS,
 } from './data.js';
@@ -15,6 +16,27 @@ import {
 
 const rnd = (n) => Math.floor(Math.random() * n);
 const pick = (list) => list[rnd(list.length)];
+/** Zufällig, aber möglichst ähnlich lang wie das Original – damit der Ersatz ins Schriftbild passt. */
+const pickLike = (list, original) => {
+  const n = textWidth(original);
+  for (const tol of [0.06, 0.12, 0.2, 0.35]) {
+    const near = list.filter((x) => Math.abs(textWidth(x) - n) <= n * tol);
+    if (near.length >= 3 || (tol === 0.35 && near.length)) return pick(near);
+  }
+  return pick(list);
+};
+
+/** Ungefähre Textbreite (in Zeichenbreiten einer serifenlosen Schrift). */
+function textWidth(t) {
+  let w = 0;
+  for (const ch of t) {
+    if (/[iljtfrI.,:;'!|\s]/.test(ch)) w += 0.3;
+    else if (/[mwMW]/.test(ch)) w += 0.85;
+    else if (/[A-ZÄÖÜ]/.test(ch)) w += 0.68;
+    else w += 0.55;
+  }
+  return w;
+}
 const UPPER = 'ABCDEFGHJKLMNPRSTUVWXYZ';
 const LOWER = 'abcdefghijkmnoprstuvwxyz';
 
@@ -146,7 +168,7 @@ export function fakeDate(original, { spreadDays = 900 } = {}) {
 // Namen (pro Namensbestandteil, damit „Max Mustermann“ und „Mustermann“ zusammenpassen)
 // ---------------------------------------------------------------------------
 
-const TITLE = /^(?:Dr\.?|Prof\.?|Dipl\.-[\p{L}]+\.?|von|van|de|zu)$/u;
+const TITLE = /^(?:Dr\.?|Prof\.?|Dipl\.-[\p{L}]+\.?|med\.?|von|van|de|zu|Herrn?|Frau|Familie)$/u;
 
 export function nameTokens(text) {
   return text.split(/[\s]+/).flatMap((t) => t.split(/(?<=-)|(?=-)/)).filter((t) => /\p{L}{2,}/u.test(t) && !TITLE.test(t));
@@ -166,8 +188,8 @@ function newNameFor(tok) {
 
 function pickName(tok) {
   const cap = (s) => (tok === tok.toUpperCase() && tok.length > 1 ? s.toUpperCase() : tok[0] === tok[0].toLowerCase() ? s.toLowerCase() : s);
-  if (FIRST_NAMES.has(tok)) return cap(pick(FEMALE.has(tok) ? FIRST_NAMES_F : FIRST_NAMES_M));
-  return cap(pick(LAST_NAMES));
+  if (FIRST_NAMES.has(tok)) return cap(pickLike(FEMALE.has(tok) ? FIRST_NAMES_F : FIRST_NAMES_M, tok));
+  return cap(pickLike(LAST_NAMES, tok));
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +272,10 @@ export class PseudonymTable {
 // Ersatzwerte für Funde
 // ---------------------------------------------------------------------------
 
+// Wörter in Blöcken, die nie ersetzt werden (Anrede, Titel, Land, Füllwörter)
+const FREE_KEEP = /^(IBAN|BIC|SWIFT|USt|HRB|HRA|GmbH|AG|KG|Tel|Fax|Mobil|Herrn?|Frau|Familie|Firma|Eheleute|An|z|Hd|Dr|Prof|med|Dipl|Deutschland|Germany|Österreich|Schweiz|Postfach|Tel|Telefon|Fax|Mobil|E-Mail|Mail|Internet|Web|Hauptverwaltung|Zentrale|Die|Der|Das|Ihre?|Für|Und)$/i;
+const ORG_WORDS = ['Nordstern', 'Sonnental', 'Lindenhof', 'Bergland', 'Talblick', 'Auental', 'Mühlenberg', 'Seeblick', 'Waldrand', 'Rosengarten'];
+
 const TEXTUAL_PLACES = /ort|land|stadt|wohnort/i;
 
 export class Pseudonymizer {
@@ -257,6 +283,9 @@ export class Pseudonymizer {
     this.table = table;
     this.tokens = new Map(); // Namensbestandteil (normalisiert) → Ersatz
     this.tokenKnown = new Set();
+    this.values = new Map(); // Wert (normalisiert) → Ersatz, innerhalb der Sitzung
+    this.orgTokens = new Map(); // Eigenname in Organisationsnamen → Ersatz
+    this.orgKnown = new Set();
   }
 
   kindOf(f) {
@@ -270,32 +299,124 @@ export class Pseudonymizer {
   }
 
   /** Ersatzwert vorbereiten: aus der Tabelle (bekannt) oder neu erzeugt. Setzt f.fake und f.known. */
+  /** Namensbestandteile bereitstellen (aus der Tabelle oder neu). Rückgabe: alle bekannt? */
+  async ensureNameTokens(toks) {
+    let allKnown = true;
+    for (const t of toks) {
+      const { key } = baseToken(t, (k) => this.tokens.has(k));
+      if (!this.tokens.has(key)) {
+        const hit = await this.table.lookup('name', key);
+        if (hit) { this.tokens.set(key, hit.fake); this.tokenKnown.add(key); }
+      }
+      if (!this.tokenKnown.has(key)) allKnown = false;
+    }
+    for (const t of toks) {
+      const { key } = baseToken(t, (k) => this.tokens.has(k));
+      if (!this.tokens.has(key)) this.tokens.set(key, newNameFor(t));
+    }
+    return allKnown && toks.length > 0;
+  }
+
   async prepare(f) {
-    if (f.cat === 'image') { f.fake = null; return; }
+    if (f.cat === 'image' || f.cat === 'manual') { f.fake = null; return; }
+    if (f.cat === 'block') return this.prepareBlock(f);
     const kind = this.kindOf(f);
     if (kind === 'name') {
       const toks = [...new Set([f.value, ...f.variants].flatMap(nameTokens))];
-      let allKnown = true;
-      for (const t of toks) {
-        const { key } = baseToken(t, (k) => this.tokens.has(k));
-        if (this.tokens.has(key)) continue;
-        const hit = await this.table.lookup('name', key);
-        if (hit) { this.tokens.set(key, hit.fake); this.tokenKnown.add(key); } else allKnown = false;
-      }
-      for (const t of toks) {
-        const { key } = baseToken(t, (k) => this.tokens.has(k));
-        if (!this.tokens.has(key)) this.tokens.set(key, newNameFor(t));
-      }
-      f.known = allKnown && toks.length > 0;
+      f.known = await this.ensureNameTokens(toks);
       f.fake = this.nameReplace(f.value);
       return;
     }
+    const vkey = `${kind}|${normForHash(kind, f.value)}`;
     const hit = await this.table.lookup(kind, f.value);
     f.known = !!hit;
-    f.fake = hit ? hit.fake : this.generate(f);
+    // Gleicher Wert im selben Dokument (z. B. einzeln und im Adressblock) → gleicher Ersatz
+    f.fake = hit ? hit.fake : this.values.get(vkey) ?? this.generate(f);
+    this.values.set(vkey, f.fake);
+  }
+
+  // -------------------------------------------------------------------------
+  // Blöcke (Adresse, Briefkopf, Fußzeile): Zeile für Zeile, Teil für Teil
+  // -------------------------------------------------------------------------
+
+  /** Organisationsnamen: Schlüsselwörter (GmbH, Krankenkasse …) bleiben, Eigennamen werden ersetzt. */
+  async orgReplace(text, collect) {
+    const out = [];
+    for (const tok of text.split(/(\s+)/)) {
+      const word = tok.replace(/[.,;:]+$/, '');
+      const isAcronym = /^[A-ZÄÖÜ]{2,5}$/.test(word);
+      const isProper = /^[A-ZÄÖÜ][a-zäöüß]{2,}(?:-[A-ZÄÖÜ][a-zäöüß]+)?$/.test(word);
+      if (!word || ORG.test(word) || !(isAcronym || isProper) || FREE_KEEP.test(word)) { out.push(tok); continue; }
+      const key = normalize(word);
+      if (!this.orgTokens.has(key)) {
+        const hit = await this.table.lookup('org', key);
+        if (hit) { this.orgTokens.set(key, hit.fake); this.orgKnown.add(key); }
+        else this.orgTokens.set(key, isAcronym ? Array.from({ length: word.length }, () => pick(UPPER)).join('') : pickLike(ORG_WORDS, word));
+      }
+      collect.org.add(key);
+      out.push(tok.replace(word, this.orgTokens.get(key)));
+    }
+    return out.join('');
+  }
+
+  /** Text eines Blocks, der keinem erkannten Teil gehört: Namen ersetzen, Organisationsnamen ersetzen, Rest behalten. */
+  async freeReplace(text, owner, collect) {
+    if (!/\p{L}/u.test(text)) return text.replace(/\d+/g, (d) => (d.length >= 3 ? shapeFake(d) : d));
+    if (ORG.test(text)) {
+      // Nur Abschnitte mit Organisationsnamen anfassen; Beschriftungen („Bankverbindung:“) bleiben
+      const pieces = text.split(/(\s[·|•]\s|,\s|[A-Za-zÄÖÜäöüß.\-]+:\s?)/);
+      let out = '';
+      for (const piece of pieces) out += piece && ORG.test(piece) && !/:\s?$/.test(piece) ? await this.orgReplace(piece, collect) : piece;
+      return out;
+    }
+    const words = text.split(/[\s,]+/).filter(Boolean);
+    const nameish = words.every((w) => /^\p{Lu}[\p{L}'-]*\.?$/u.test(w) || /^(und|&|u\.|c\/o|von|van|de|zu)$/i.test(w));
+    if (owner !== 'person' || !nameish) return text;
+    const toks = words.filter((w) => !FREE_KEEP.test(w.replace(/\.$/, '')) && /^\p{Lu}\p{Ll}+/u.test(w) && !TITLE.test(w));
+    if (!toks.length) return text;
+    if (!(await this.ensureNameTokens(toks))) collect.allKnown = false;
+    toks.forEach((t) => collect.names.add(t));
+    return this.nameReplace(text);
+  }
+
+  async prepareBlock(f, { fresh = false } = {}) {
+    const collect = { names: new Set(), org: new Set(), subs: [], allKnown: true };
+    f.lineFakes = new Map();
+    const seen = new Set();
+    for (const occ of f.occurrences) {
+      if (seen.has(occ.text)) continue;
+      seen.add(occ.text);
+      const parts = [...(occ.parts || [])].sort((a, b) => a.start - b.start);
+      let out = '', pos = 0;
+      for (const p of parts) {
+        if (p.start < pos) continue;
+        out += await this.freeReplace(occ.text.slice(pos, p.start), f.owner, collect);
+        const sub = { cat: p.cat, label: p.label || '', value: p.text, variants: [] };
+        await this.prepare(sub);
+        if (fresh) this.regenerate(sub);
+        if (!sub.known) collect.allKnown = false;
+        collect.subs.push(sub);
+        out += sub.fake ?? p.text;
+        pos = p.end;
+      }
+      out += await this.freeReplace(occ.text.slice(pos), f.owner, collect);
+      f.lineFakes.set(occ.text, out);
+    }
+    if ([...collect.org].some((k) => !this.orgKnown.has(k))) collect.allKnown = false;
+    f.subs = collect.subs;
+    f.freeNames = [...collect.names];
+    f.orgKeys = [...collect.org];
+    f.known = collect.allKnown && (f.subs.length > 0 || f.freeNames.length > 0);
+    const first = f.occurrences.filter((o, i, a) => a.findIndex((x) => x.text === o.text) === i);
+    f.fake = first.map((o) => f.lineFakes.get(o.text)).join('\n');
   }
 
   regenerate(f) {
+    if (f.cat === 'block') {
+      for (const n of f.freeNames || []) { const { key } = baseToken(n, () => false); this.tokens.set(key, newNameFor(n)); this.tokenKnown.delete(key); }
+      for (const k of f.orgKeys || []) { this.orgTokens.delete(k); this.orgKnown.delete(k); }
+      return this.prepareBlock(f, { fresh: true });
+    }
     if (this.kindOf(f) === 'name') {
       for (const t of [f.value, ...f.variants].flatMap(nameTokens)) {
         const { key } = baseToken(t, (k) => this.tokens.has(k));
@@ -303,7 +424,10 @@ export class Pseudonymizer {
         this.tokenKnown.delete(key);
       }
       f.fake = this.nameReplace(f.value);
-    } else f.fake = this.generate(f);
+    } else {
+      f.fake = this.generate(f);
+      this.values.set(`${this.kindOf(f)}|${normForHash(this.kindOf(f), f.value)}`, f.fake);
+    }
     f.known = false;
   }
 
@@ -321,7 +445,7 @@ export class Pseudonymizer {
     const make = {
       iban: () => fakeIban(v),
       creditcard: () => fakeCard(v),
-      taxid: () => (/^\d[\d ]{10,13}$/.test(v) ? fakeTaxId(v) : shapeFake(v)),
+      taxid: () => (/^\d[\d ]{10,13}$/.test(v) ? fakeTaxId(v) : /^[A-Z]{2,3}\s?\d/.test(v) ? v.match(/^[A-Z]{2,3}/)[0] + shapeFake(v.replace(/^[A-Z]{2,3}/, '')) : shapeFake(v)),
       svnr: () => fakeSvnr(v),
       birthdate: () => fakeDate(v, { spreadDays: 1100 }),
       date: () => fakeDate(v, { spreadDays: 60 }),
@@ -330,10 +454,11 @@ export class Pseudonymizer {
       address: () => this.fakeAddress(v),
       bic: () => applyPattern(v, Array.from({ length: 4 }, () => pick(UPPER)).join('') + compactOf(v).slice(4, 6) + shapeFake(compactOf(v).slice(6))),
       url: () => (/^https?:/i.test(v) ? 'https://' : '') + (/www\./i.test(v) ? 'www.' : '') + pick(['beispiel.de', 'beispiel-seite.de', 'example.org']),
+      amount: () => v.replace(/\d/g, (d, i) => (i === v.search(/\d/) && d !== '0' ? String(1 + rnd(9)) : String(rnd(10)))),
       ip: () => `10.${rnd(256)}.${rnd(256)}.${1 + rnd(254)}`,
-      personal: () => (TEXTUAL_PLACES.test(f.label) ? pick(CITIES) : /\d/.test(v) ? shapeFake(v) : '[anonymisiert]'),
+      personal: () => (TEXTUAL_PLACES.test(f.label) ? pickLike(CITIES, v) : (v.match(/\p{L}/gu) || []).length <= 3 ? shapeFake(v) : '[anonymisiert]'),
       hint: () => (/\d/.test(v) ? shapeFake(v) : '[anonymisiert]'),
-    }[f.cat] || (() => shapeFake(v));
+    }[f.cat] || (() => (f.label === 'Handelsregister' ? v.replace(/\d/g, () => String(rnd(10))) : shapeFake(v)));
     return differs(make, v);
   }
 
@@ -357,17 +482,20 @@ export class Pseudonymizer {
   }
 
   fakeAddress(v) {
+    if (/^Postfach\b/i.test(v)) return v.replace(/\d/g, () => String(rnd(10))).replace(/Postfach\s+0/, 'Postfach 1');
     let m = v.match(/^(.*?)(\s?\d{1,4}.*)$/);
     if (m && /\p{L}/u.test(m[1]) && !/^\d/.test(v)) {
       // Straße + Hausnummer
-      return pick(STREETS) + m[2].replace(/\d+/g, (d) => String(1 + rnd(d.length > 1 ? 99 : 9)));
+      return pickLike(STREETS, m[1]) + m[2].replace(/\d+/g, (d) => String(1 + rnd(d.length > 1 ? 99 : 9)));
     }
-    if ((m = v.match(/^((?:D-)?)(\d{5})(\s+)(.+)$/))) return `${m[1]}${String(10000 + rnd(89999))}${m[3]}${pick(CITIES)}`;
+    if ((m = v.match(/^((?:D-)?)(\d{5})(\s+)(.+)$/))) return `${m[1]}${String(10000 + rnd(89999))}${m[3]}${pickLike(CITIES, m[4])}`;
+    if (/^Postfach\b/i.test(v)) return v.replace(/\d/g, () => String(rnd(10))).replace(/Postfach\s+0/, 'Postfach 1');
     return shapeFake(v);
   }
 
   /** Ersatztext für ein einzelnes Vorkommen (Formatierung des Vorkommens bleibt erhalten). */
   fakeFor(f, occText) {
+    if (f.cat === 'block') return f.lineFakes?.get(occText) ?? occText;
     if (this.kindOf(f) === 'name') return this.nameReplace(occText);
     if (occText === f.value || !f.fake) return f.fake;
     const a = compactOf(occText), b = compactOf(f.value);
@@ -379,6 +507,15 @@ export class Pseudonymizer {
   async commit(findings) {
     for (const f of findings) {
       if (f.action !== 'replace' || !f.fake) continue;
+      if (f.cat === 'block') {
+        await this.commit((f.subs || []).map((sub) => ({ ...sub, action: 'replace' })));
+        for (const n of f.freeNames || []) {
+          const { key } = baseToken(n, (k) => this.tokens.has(k));
+          if (this.tokens.has(key)) await this.table.remember('name', key, this.tokens.get(key), 'Name');
+        }
+        for (const k of f.orgKeys || []) if (this.orgTokens.has(k)) await this.table.remember('org', k, this.orgTokens.get(k), 'Organisation');
+        continue;
+      }
       const kind = this.kindOf(f);
       if (kind === 'name') {
         for (const t of [f.value, ...f.variants].flatMap(nameTokens)) {
