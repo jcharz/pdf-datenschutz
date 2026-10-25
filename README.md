@@ -12,12 +12,57 @@ bewertet sie und zeigt sie in einer Liste. Pro Fund entscheidest du: **schwärze
 2. **Liste prüfen.** Jeder Fund zeigt den *echten Wert*, der geändert würde (z. B. `12 150380 M 123`, nicht nur
    „Versicherungsnummer“), dazu die Bewertung, die Seite und wie oft er vorkommt.
    Ein Tipp auf den Wert springt zur Stelle im Dokument.
-3. **Pro Fund wählen:** *Schwärzen* · *Ersetzen* · *Behalten*. Bei *Ersetzen* steht der Ersatzwert darunter
-   (🎲 = neuen erzeugen).
+3. **Pro Fund wählen:** *Schwärzen* · *Ersetzen* · *Behalten*. Unter jedem Fund steht immer, **womit er ersetzt
+   würde** („Ersatz wäre …“ bzw. „wird zu …“, 🎲 = anderen Ersatz erzeugen). Tippst du auf einen Fund, zeigt das
+   Dokument den Ersatz als kleines Schild an der Stelle. Nach dem Anwenden listet der Prüfbericht alle Ersetzungen auf.
 4. **Hinweise geben** (tippen oder über das 🎤 der iPhone-Tastatur diktieren):
    „auch Projekt Alpha“, „den Namen Erika Muster“, „alle Datumsangaben“, „behalte die Beträge“.
 5. **Anwenden.** Das Ergebnis erscheint sofort. Mit **Vorher | Nachher** vergleichst du an genau derselben Stelle.
 6. **Speichern.** Standardmäßig unter demselben Namen, ein anderer Name lässt sich im Speichern-Dialog eingeben.
+7. **Optional: „📋 Als Schablone merken“.** Beim nächsten Dokument derselben Art (z. B. die nächste Abrechnung der
+   Krankenkasse) erkennt die App das Formular wieder und fragt, ob sie die Bearbeitung als Ganzes übernehmen soll.
+
+## Bearbeitungsschablonen
+
+Eine Schablone merkt sich, **wie** ein Formular bearbeitet wurde:
+
+- je Feld die Entscheidung (Versichertennummer → ersetzen, Adressblock → ersetzen, Ansprechpartner → schwärzen …),
+  auch bei Tabellen in der richtigen Reihenfolge („erste Datumszeile schwärzen“),
+- von Hand markierte Bereiche (relative Position auf der Seite),
+- deine Hinweise („auch Physiotherapie“).
+
+Wiedererkannt wird ein Formular an seinen **festen Texten** (Beschriftungen, Überschriften), nicht an den
+eingetragenen Werten. Ab etwa 60 % Übereinstimmung erscheint oben in der Liste: *„Bekanntes Formular: … Schablone
+anwenden?“*. Neue, unbekannte Felder behalten ihren normalen Vorschlag.
+
+**Datenschutz:** Schablonen enthalten keine Inhalte des Dokuments, nur gesalzene Fingerabdrücke der festen
+Formulartexte, die Entscheidungen und die Hinweise ebenfalls als Fingerabdruck. Verwalten, löschen sowie sichern und
+wiederherstellen (zusammen mit der Pseudonym-Tabelle) geht unter ⚙︎.
+
+## Deine Daten und Absenderdaten
+
+Die Liste ist zweigeteilt:
+
+- **Deine Daten**: alles, was dich (oder andere Privatpersonen) betrifft, also Name, Anschrift, Versicherten- und
+  Kundennummern, Bankverbindung, Gesundheitsangaben … Hohe und mittlere Risiken sind vorausgewählt.
+- **Absender & Organisationen**: Briefkopf, Absenderzeile im Adressfenster, Fußzeile (Sitz, Handelsregister,
+  Bankverbindung der Firma), Ansprechpartner/Sachbearbeiter mit Durchwahl, Service-E-Mail, Webadresse, Unterschrift
+  unter dem Brief einer Organisation. Diese Funde bleiben standardmäßig **stehen** (in ⚙︎ umstellbar).
+
+„Absender“ wird nur bei klaren Belegen vergeben (z. B. „GmbH“, „Krankenkasse“, „info@“, „www.“, Fußzeile,
+„Ansprechpartner:“). Im Zweifel zählt ein Fund zu deinen Daten. Bei jedem Fund kannst du die Zuordnung mit
+**„↺ Gehört zum Absender / zu meinen Daten“** umstellen.
+
+## Adressen als Block
+
+Zusammengehörige Angaben werden als **ein Fund** behandelt, nicht einzeln nach Straße, PLZ und Ort:
+
+- **Adressblock** (Empfänger im Adressfenster, „Herrn/Frau …“ bis „PLZ Ort“)
+- **Absenderzeile** (`Firma · Postfach … · PLZ Ort`), **Briefkopf**, **Fußzeile** (alle Zeilen mit Funden)
+- einzeilige Adressen im Text („wohnhaft Am Rosengarten 5, 79098 Freiburg“)
+
+Beim Ersetzen wird der Block zeilenweise und stimmig ersetzt: „Herrn“ bleibt, Name, Straße und PLZ/Ort bekommen
+passende Ersatzwerte, die zu den übrigen Stellen im Brief passen („Sehr geehrter Herr …“).
 
 ## Was erkannt wird
 
@@ -85,12 +130,22 @@ und „Ersetzen“ bestätigen. Am Computer (Chrome/Edge) wird die geöffnete Da
 npm start              # lokaler Server auf http://localhost:8080
 npm test               # Erkennung, Ersatzwerte, Tabelle (Node, keine Abhängigkeiten)
 npm run test:e2e       # kompletter Ablauf im Browser (Playwright + Chromium)
+npm run test:samples   # Auswertung an 11 Beispieldokumenten inkl. Schablonen-Ablauf
 ```
+
+`tests/samples.cjs` erzeugt erfundene, aber realistische Dokumente: Krankenkassen-Abrechnung (zweimal, für den
+Schablonen-Test), Handwerkerrechnung, Arztbrief, Formular mit Beschriftung über dem Wert, Kontoauszug,
+Finanzamt-Bescheid, Privatbrief, Arbeitsvertrag, zweiseitiger Kanzleibrief und einen aus HTML gedruckten Brief.
+`tests/evaluate.cjs` prüft je Dokument, ob alles erkannt und richtig zugeordnet wird (eigene Daten oder Absender,
+Blöcke, vollständige Werte, keine Fehltreffer). Danach ersetzt es alle eigenen Daten und prüft, dass davon nichts
+mehr im Ergebnis-PDF steht.
 
 | Datei | Aufgabe |
 | --- | --- |
 | `js/app.js` | Oberfläche und Ablauf |
-| `js/detect.js` | Automatische Erkennung, Bewertung, Hinweise verstehen |
+| `js/detect.js` | Automatische Erkennung im Text, Bewertung, Hinweise verstehen |
+| `js/structure.js` | Seitenlayout: Blöcke, Werte unter/neben Beschriftungen, eigene Daten oder Absender |
+| `js/templates.js` | Bearbeitungsschablonen (Wiedererkennung, Regeln) |
 | `js/data.js` | Vornamen, Nachnamen, Straßen, Orte (Erkennung und Ersatzwerte) |
 | `js/pseudo.js` | Ersatzwerte mit Prüfziffern, Pseudonym-Tabelle |
 | `js/pdfmodel.js` | Text, Zeichenpositionen und Bilder einer Seite |
@@ -100,7 +155,7 @@ npm run test:e2e       # kompletter Ablauf im Browser (Playwright + Chromium)
 
 ## Grenzen
 
-- Die Erkennung arbeitet mit Regeln, Mustern, Prüfziffern und Namenslisten, nicht mit einer KI. Seltene Namen ohne
+- Die Erkennung arbeitet mit Regeln, Mustern, Prüfziffern, Namenslisten und dem Seitenlayout, nicht mit einer KI. Seltene Namen ohne
   Anrede oder Bezeichnung können durchrutschen. In dem Fall hilft ein Hinweis („den Namen …“).
 - Text in Bildern und eingescannten Seiten wird nicht gelesen. Dafür gibt es ▭.
 - Ersatztext wird in einer Standardschrift eingesetzt. Er passt sich Größe, Farbe und Breite an, sieht aber nicht immer exakt aus wie die Originalschrift.

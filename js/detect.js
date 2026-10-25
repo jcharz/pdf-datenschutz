@@ -117,6 +117,9 @@ const DATE_ANY =
 const B = '(?<![\\p{L}\\p{N}])'; // Wortanfang (Unicode-fähig)
 const E = '(?![\\p{L}\\p{N}])'; // Wortende
 const CAP = "[A-ZÄÖÜ][a-zäöüß]+(?:-[A-ZÄÖÜ][a-zäöüß]+)?";
+// Titel vor Namen und Wörter, die nach „Frau“/„Ihre“ usw. kein Name sind
+const TITLES = '(?:(?:Dr|Prof|Dipl\\.-\\p{L}+|med|rer|nat|dent|vet|jur|phil|habil|h\\.[ ]?c)\\.?[ ]+|(?:Kollegin|Kollege|Doktor|Professor(?:in)?)[ ]+)*';
+const NAMEW = `(?!(?:Ihr|Ihre|Ihres|Ihren|Dein|Deine|Euer|Eure|Team|Abteilung|Die|Der|Das|Kollegin|Kollege|Herrn?|Frau|Familie)(?![\\p{L}]))${CAP}`;
 const FN = [...FIRST_NAMES].sort((a, b) => b.length - a.length).join('|');
 
 function ibanValid(raw) {
@@ -126,6 +129,19 @@ function ibanValid(raw) {
   let rest = 0;
   for (const d of re) rest = (rest * 10 + Number(d)) % 97;
   return rest === 1;
+}
+
+/** Prüfziffer der Steuer-Identifikationsnummer (ISO 7064, MOD 11,10). */
+function taxIdValid(raw) {
+  const d = raw.replace(/\D/g, '');
+  if (d.length !== 11 || d[0] === '0') return false;
+  let product = 10;
+  for (let i = 0; i < 10; i++) {
+    let sum = (Number(d[i]) + product) % 10;
+    if (sum === 0) sum = 10;
+    product = (sum * 2) % 11;
+  }
+  return (11 - product) % 10 === Number(d[10]);
 }
 
 function luhnValid(raw) {
@@ -143,10 +159,11 @@ function luhnValid(raw) {
 /** IBAN: längste gültige Teilfolge finden (falls direkt dahinter z. B. „BIC“ steht). */
 function findIban(text) {
   const out = [];
-  const rx = /(?<![A-Z0-9])[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,3})?/g;
+  // Auch über einen Zeilenumbruch hinweg (Fließtext bricht IBANs oft mitten in der Nummer um)
+  const rx = /(?<![A-Z0-9])[A-Z]{2}\d{2}(?:[ \n]?[A-Z0-9]{4}){2,7}(?:[ \n]?[A-Z0-9]{1,3})?/g;
   for (const m of text.matchAll(rx)) {
     let s = m[0];
-    while (s.replace(/ /g, '').length >= 15) {
+    while (s.replace(/\s/g, '').length >= 15) {
       if (ibanValid(s)) { out.push({ start: m.index, end: m.index + s.length }); break; }
       s = s.slice(0, -1).trimEnd();
     }
@@ -207,6 +224,10 @@ export const CATEGORIES = [
       },
       { rx: /(?<![\p{L}\p{N}])((?:D-)?\d{5}[ \t]+[A-ZÄÖÜ][a-zäöüß]+(?:[\- ](?:am|an der|im|ob der|bei|[A-ZÄÖÜ][a-zäöüß]+)){0,2})/gu, group: 1 },
       { rx: /\bPostfach\s+\d[\d ]{1,8}\d/g },
+      // Straße ohne typische Endung direkt vor der Postleitzahl: „Hafenkante 12 · 20457 Hamburg“, „Neuer Wall 7, 20354 …“
+      { rx: /(?<![\p{L}\p{N}])((?:[A-ZÄÖÜ][a-zäöüß\-]+[ ])?[A-ZÄÖÜ][a-zäöüß\-]{2,}[ ]\d{1,4}[ ]?[a-zA-Z]?)(?=[ ]?(?:,|·|\||•|\n)[ ]*(?:D-)?\d{5}[ ]\p{Lu})/gu, group: 1 },
+      // „Am Mühlbach 3“, „An der Alster 12“, „Im Grund 4“
+      { rx: /(?<![\p{L}\p{N}])((?:Am|An der|An den|Auf der|Auf dem|Im|In der|Zum|Zur|Hinter der|Unter den)[ ][A-ZÄÖÜ][a-zäöüß]+(?:[\- ][A-ZÄÖÜ][a-zäöüß]+)?[ ]\d{1,4}[ ]?[a-zA-Z]?)(?![\p{L}\p{N}])/gu, group: 1 },
     ],
   },
   {
@@ -235,7 +256,9 @@ export const CATEGORIES = [
     id: 'taxid', label: 'Steuer-ID / Steuernummer / USt-ID',
     say: /\b(steuer ?id\w*|steuerid\w*|steueridentifikation\w*|steuernummer\w*|umsatzsteuer\w*|ust ?id\w*|steuer\w*)\b/,
     patterns: [
-      { rx: /(?:Steuer-?ID|Steuer-?Identifikationsnummer|Identifikationsnummer|IdNr\.?)\s*[:.]?\s*(\d{2}\s?\d{3}\s?\d{3}\s?\d{3})/gi, group: 1 },
+      { rx: /(?:Steuer-?ID|Steuer-?Identifikationsnummer|Identifikationsnummer|IdNr\.?)[^:\n\d]{0,25}[:.]?\s*(\d{2}\s?\d{3}\s?\d{3}\s?\d{3})(?!\d)/gi, group: 1 },
+      // Steuer-ID ohne Beschriftung: nur mit gültiger Prüfziffer
+      { rx: /(?<!\d ?)\d{2} \d{3} \d{3} \d{3}(?! ?\d)|(?<!\d)[1-9]\d{10}(?!\d)/g, valid: taxIdValid },
       { rx: /(?:Steuer-?Nr\.?|Steuernummer|St\.?-?Nr\.?)\s*[:.]?\s*(\d[\d\/ ]{8,15}\d)/gi, group: 1 },
       { rx: /\b(?:DE|ATU)\s?\d{8,9}\b/g },
     ],
@@ -249,9 +272,9 @@ export const CATEGORIES = [
     id: 'names', label: 'Personennamen (Anrede, „Name:“, Grußformel)',
     say: /\b(namen|name|personennamen|personen|person|personendaten)\b/,
     patterns: [
-      { rx: new RegExp(`(?<![\\p{L}])(?:Herrn?|Frau|Hr\\.|Fr\\.)[ ]+(?:(?:Dr|Prof|Dipl\\.-\\p{L}+)\\.?[ ]+)*((?:${CAP}[ ]+){0,2}${CAP})`, 'gu'), group: 1 },
+      { rx: new RegExp(`(?<![\\p{L}])(?:Herrn?|Frau|Hr\\.|Fr\\.)[ ]+${TITLES}((?:${NAMEW}[ ]+){0,2}${NAMEW})`, 'gu'), group: 1 },
       { rx: new RegExp(`(?:Name|Vorname|Nachname|Familienname|Geburtsname|Ansprechpartner(?:in)?|Kontoinhaber(?:in)?|Patient(?:in)?|Mandant(?:in)?|Empfänger(?:in)?|Absender(?:in)?|Unterzeichner(?:in)?|Inhaber(?:in)?|Versicherte[rn]?|Antragsteller(?:in)?|Bearbeiter(?:in)?|Sachbearbeiter(?:in)?|Ehepartner(?:in)?|Kind|Vater|Mutter|Arzt|Ärztin|Mieter(?:in)?|Vermieter(?:in)?|Kunde|Kundin|Schuldner(?:in)?|Gläubiger(?:in)?)[ ]*:[ ]*((?:${CAP}[ ]+){0,2}${CAP})`, 'gu'), group: 1 },
-      { rx: new RegExp(`(?:Mit freundlichen Grüßen|Viele Grüße|Beste Grüße|Freundliche Grüße|Hochachtungsvoll)[,]?\\s*\\n\\s*((?:${CAP}[ ]+){0,2}${CAP})`, 'gu'), group: 1 },
+      { rx: new RegExp(`(?:Mit (?:\\p{L}+ ){0,2}Grüßen|Viele Grüße|Beste Grüße|Freundliche Grüße|Herzliche Grüße|Hochachtungsvoll)[,]?[ \\t]*\\n(?:[ \\t]*(?:Ihre?|i\\.[ ]?A\\.|i\\.[ ]?V\\.|ppa\\.)[^\\n]*\\n){0,2}[ \\t]*${TITLES}((?:${NAMEW}[ ]+){0,2}${NAMEW})`, 'gu'), group: 1 },
       // Bekannter Vorname + großgeschriebenes Wort („Erika Meyer“, „Anna Maria Schmidt“)
       { rx: new RegExp(`(?<![\\p{L}])((?:${FN})(?:[ ]+(?:${FN}))?[ ]+${CAP})(?![\\p{L}])`, 'gu'), group: 1 },
     ],
@@ -288,8 +311,8 @@ export const CATEGORIES = [
 // ---------------------------------------------------------------------------
 
 /** Reihenfolge = Vorrang bei Überschneidungen (spezifisch vor allgemein). */
-const SCAN_ORDER = ['iban', 'creditcard', 'svnr', 'taxid', 'email', 'url', 'ip', 'bic', 'birthdate', 'personal', 'phone',
-  'idnumber', 'address', 'names', 'kfz', 'date', 'amount', 'number'];
+const SCAN_ORDER = ['iban', 'creditcard', 'svnr', 'taxid', 'email', 'url', 'ip', 'bic', 'birthdate', 'personal', 'idnumber',
+  'phone', 'address', 'names', 'kfz', 'date', 'amount', 'number'];
 
 const RISK = {
   iban: 'hoch', creditcard: 'hoch', svnr: 'hoch', taxid: 'hoch', birthdate: 'hoch', hint: 'hoch',
@@ -324,31 +347,59 @@ function overlapsAny(list, m) {
   return list.some((o) => m.start < o.end && o.start < m.end);
 }
 
-/**
- * Durchsucht alle Seiten nach möglicherweise kritischen Daten.
- * Rückgabe: [{ key, cat, label, risk, value, variants, occurrences: [{page, start, end, text}] }]
- */
-export function scanDocument(pages) {
+/** Alle Kandidaten aller Kategorien (noch mit Überschneidungen). prio = Vorrang. */
+export function scanCandidates(pages) {
   const cands = [];
   SCAN_ORDER.forEach((cat, prio) => {
-    for (const m of findMatches({ kind: 'category', cat }, pages)) cands.push({ ...m, cat, prio });
+    for (const m of findMatches({ kind: 'category', cat }, pages)) {
+      cands.push({ ...m, cat, prio, label: m.label || contextLabel(cat, pages[m.page], m.start) });
+    }
   });
-  cands.sort((a, b) => a.prio - b.prio || (b.end - b.start) - (a.end - a.start));
-  const claimed = pages.map(() => []);
-  const groups = new Map();
-  for (const c of cands) {
+  return cands;
+}
+
+const LABEL_ADOPT = new Set(['taxid', 'svnr', 'iban', 'bic', 'phone', 'email', 'birthdate', 'creditcard', 'date', 'amount', 'number']);
+/** Beschriftung direkt vor dem Wert („Steuernummer: …“) als Bezeichnung übernehmen. */
+function contextLabel(cat, text, start) {
+  if (!LABEL_ADOPT.has(cat)) return undefined;
+  const prefix = text.slice(Math.max(0, text.lastIndexOf('\n', start - 1) + 1), start);
+  const m = prefix.match(/([\p{L}][\p{L}\-.]*(?:[ ][\p{L}][\p{L}\-.]*){0,2})[ \t]*[:#][ \t]*$/u);
+  if (!m || m[1].length > 35) return undefined;
+  const label = m[1].replace(/\.$/, '');
+  // Nur sinnvolle Beschriftungen (keine Namen o. Ä.): mindestens ein kleingeschriebenes Wort oder bekannte Abkürzung
+  return /[a-zäöü]{3}|^(IBAN|BIC|USt|SWIFT|Tel|Fax)/.test(label) ? label : undefined;
+}
+
+export const PRIO = Object.fromEntries(SCAN_ORDER.map((c, i) => [c, i]));
+
+/** Überschneidungen auflösen: spezifische Kategorie vor allgemeiner, bei gleicher die längere Stelle. */
+export function claimCandidates(cands, pageCount) {
+  const sorted = [...cands].sort((a, b) => a.prio - b.prio || (b.end - b.start) - (a.end - a.start));
+  const claimed = Array.from({ length: pageCount }, () => []);
+  for (const c of sorted) {
     if (!c.text.trim() || overlapsAny(claimed[c.page], c)) continue;
     claimed[c.page].push(c);
-    const key = valueKey(c.cat, c.text);
+  }
+  return claimed.flat().sort((a, b) => a.page - b.page || a.start - b.start);
+}
+
+/** Gleiche Werte (gleiche Kategorie, gleiche Zuordnung) zu einem Fund zusammenfassen. */
+export function groupOccurrences(cands) {
+  const groups = new Map();
+  const ownerKey = (c) => (c.owner ? `|${c.owner}` : '');
+  for (const c of cands) {
+    const key = valueKey(c.cat, c.text) + ownerKey(c);
     if (!groups.has(key)) {
-      groups.set(key, { key, cat: c.cat, label: c.label || SHORT[c.cat], risk: riskOf(c.cat, c.label), occurrences: [] });
+      groups.set(key, { key, cat: c.cat, label: c.label || SHORT[c.cat], risk: riskOf(c.cat, c.label), owner: c.owner, occurrences: [] });
     }
     groups.get(key).occurrences.push({ page: c.page, start: c.start, end: c.end, text: c.text });
   }
   // „Mustermanns“ (Genitiv) zur Person „Mustermann“ legen
   for (const [key, g] of groups) {
-    if (g.cat !== 'names' || !key.endsWith('s')) continue;
-    const base = groups.get(key.slice(0, -1));
+    if (g.cat !== 'names') continue;
+    const [, base0, suffix = ''] = key.match(/^(.*?)(\|(?:person|sender))?$/);
+    if (!base0.endsWith('s')) continue;
+    const base = groups.get(base0.slice(0, -1) + suffix);
     if (base && base !== g) { base.occurrences.push(...g.occurrences); groups.delete(key); }
   }
   const out = [...groups.values()];
@@ -358,56 +409,100 @@ export function scanDocument(pages) {
     g.value = texts.reduce((a, b) => (b.length > a.length ? b : a));
     g.variants = texts.filter((t) => t !== g.value);
   }
-  const order = { hoch: 0, mittel: 1, niedrig: 2 };
-  out.sort((a, b) => order[a.risk] - order[b.risk] || a.occurrences[0].page - b.occurrences[0].page || a.occurrences[0].start - b.occurrences[0].start);
-  return out;
+  return sortFindings(out);
 }
+
+const RISK_ORDER = { hoch: 0, mittel: 1, niedrig: 2 };
+export function sortFindings(list) {
+  const first = (f) => f.occurrences[0] || { page: 0, start: 0 };
+  return list.sort((a, b) => RISK_ORDER[a.risk] - RISK_ORDER[b.risk] || first(a).page - first(b).page || first(a).start - first(b).start);
+}
+
+/**
+ * Durchsucht alle Seiten nach möglicherweise kritischen Daten (nur Text, ohne Seitenlayout).
+ * Rückgabe: [{ key, cat, label, risk, value, variants, occurrences: [{page, start, end, text}] }]
+ */
+export function scanDocument(pages) {
+  return groupOccurrences(claimCandidates(scanCandidates(pages), pages.length));
+}
+
+export { riskOf };
 
 // Wert hinter einer Bezeichnung wie „Versicherungsnummer: 12 345678 A 123“ oder „Aktenzeichen 4 O 123/24“
 const ID_LABEL = /(?<![\p{L}])((?:[\p{L}][\p{L}\-]*?(?:nummer|Nummer|-Nr\.?|-ID|-Id|kennung|Kennung|kennzeichen|Kennzeichen|zeichen|Zeichen|code|Code))|Nr\.|No\.|Az\.|ID|Ihr Zeichen|Unser Zeichen|Pass-?Nr\.?)(?![\p{L}])[ \t]*[:#.]?[ \t]*/gu;
 const ID_HIGH = /versicher|ausweis|pass|führerschein|patient|steuer|sozial|renten|kranken|personal|identifikation/i;
-const ID_SKIP = /^(?:telefon|tel|fax|handy|mobil|konto|iban|haus|seiten|blatt|zimmer|raum)/i;
+const REGISTER = /(?<![\p{L}])(?:HRB|HRA|VR|GnR|PR)[ ]?\d{2,7}(?:[ ]?[A-Z]{1,2})?(?![\p{L}\p{N}])/gu;
+const ID_SKIP = /^(?:telefon|tel|fax|handy|mobil|ruf|durchwahl|konto|iban|haus|seiten|blatt|zimmer|raum|steuer|sozialversicherung|versicherungsnummer)/i;
+
+/** Liest einen Kennwert ab Position `pos` (gleiche Zeile). Rückgabe: Ende des Werts oder -1. */
+function idValueEnd(text, pos) {
+  const lineEnd = text.indexOf('\n', pos) < 0 ? text.length : text.indexOf('\n', pos);
+  const rest = text.slice(pos, lineEnd);
+  const toks = [...rest.matchAll(/\S+/g)];
+  let end = -1, digits = 0;
+  for (let i = 0; i < toks.length; i++) {
+    const raw = toks[i][0];
+    const t = raw.replace(/[,;)]+$/, '').replace(/\.$/, '');
+    const gap = i ? toks[i].index - (toks[i - 1].index + toks[i - 1][0].length) : toks[i].index;
+    if (gap > 4) break;
+    const next = toks[i + 1]?.[0] || '';
+    const hasDigit = /\d/.test(t);
+    const sep = /^[\/\-–]$/.test(t);
+    const shortCaps = /^[A-Z]{1,3}$/.test(t) && /\d/.test(next);
+    const code = /^[A-Za-z0-9][A-Za-z0-9\-\/.]*$/.test(t);
+    if (sep) { if (end < 0 || !/\d/.test(next)) break; continue; }
+    if (i === 0 && !(hasDigit && code) && !shortCaps && !/^[A-Z]{1,4}[\-\/]/.test(t)) break;
+    if (!((hasDigit && code) || shortCaps || (i === 0 && code))) break;
+    digits += (t.match(/\d/g) || []).length;
+    end = pos + toks[i].index + t.length;
+    if (t.length !== raw.length && !/\.$/.test(raw)) break;
+  }
+  return digits >= 2 ? end : -1;
+}
 
 function findLabeledIds(text) {
-  const out = [];
+  const out = [...text.matchAll(REGISTER)].map((m) => ({ start: m.index, end: m.index + m[0].length, label: 'Handelsregister' }));
   for (const m of text.matchAll(ID_LABEL)) {
     const label = m[1];
     if (ID_SKIP.test(label)) continue;
     let pos = m.index + m[0].length;
-    const lineEnd = text.indexOf('\n', pos) < 0 ? text.length : text.indexOf('\n', pos);
-    const rest = text.slice(pos, lineEnd);
-    // Werte-Tokens einsammeln: enthalten Ziffern oder sind kurze Großbuchstaben-Gruppen zwischen Ziffern
-    const toks = [...rest.matchAll(/\S+/g)];
-    let end = -1, digits = 0;
-    for (let i = 0; i < toks.length; i++) {
-      const t = toks[i][0].replace(/[,;)]+$/, '');
-      const gap = i ? toks[i].index - (toks[i - 1].index + toks[i - 1][0].length) : toks[i].index;
-      if (gap > 2) break;
-      const hasDigit = /\d/.test(t);
-      const shortCaps = /^[A-Z]{1,3}$/.test(t) && toks[i + 1] && /\d/.test(toks[i + 1][0]);
-      if (!/^[A-Za-z0-9\-\/.]+$/.test(t) || (!hasDigit && !shortCaps && i > 0) || (!hasDigit && !/^[A-Z0-9]/.test(t))) break;
-      if (!hasDigit && i === 0 && !shortCaps && !/^[A-Z]{1,4}[\-\/]/.test(t)) break;
-      digits += (t.match(/\d/g) || []).length;
-      end = toks[i].index + t.replace(/\.$/, '').length;
-      if (t.length !== toks[i][0].length) break;
-    }
-    if (end > 0 && digits >= 2) out.push({ start: pos, end: pos + end, label: label.replace(/[:.]$/, '') });
+    // Beschriftung steht allein am Zeilenende → Wert in der nächsten Zeile (Spalten-/Tabellenlayout)
+    if (/^[ \t]*(\n|$)/.test(text.slice(pos, pos + 40))) pos = text.indexOf('\n', pos) + 1;
+    if (pos <= 0) continue;
+    while (text[pos] === ' ' || text[pos] === '\t') pos++;
+    const end = idValueEnd(text, pos);
+    if (end > pos) out.push({ start: pos, end, label: label.replace(/[:.]$/, '') });
   }
   return out;
 }
 
 // Persönliche Angaben in Textform („Geburtsort: Hamburg“, „Diagnose: …“)
-const PERSONAL_LABELS = 'Geburtsort|Geburtsland|Staatsangehörigkeit|Nationalität|Familienstand|Konfession|Religion|Religionszugehörigkeit|Geschlecht|Diagnosen?|Befund|Krankenkasse|Krankenversicherung|Arbeitgeber(?:in)?|Beruf|Grad der Behinderung|Behinderung|Blutgruppe|Allergien|Allergie|Vorerkrankungen|Medikation|Medikamente|Steuerklasse|Kinder|Einkommen|Gehalt|Bruttogehalt|Nettogehalt';
+export const PERSONAL_LABELS = 'Geburtsort|Geburtsland|Staatsangehörigkeit|Nationalität|Familienstand|Konfession|Religion|Religionszugehörigkeit|Geschlecht|Diagnosen?|Befund|Krankenkasse|Krankenversicherung|Arbeitgeber(?:in)?|Beruf|Grad der Behinderung|Behinderung|Blutgruppe|Allergien|Allergie|Vorerkrankungen|Medikation|Medikamente|Steuerklasse|Kinder|Einkommen|Gehalt|Bruttogehalt|Nettogehalt';
 const PERSONAL_HIGH = /diagnos|befund|religion|konfession|behinderung|blutgruppe|allergie|vorerkrank|medika/i;
 function findPersonal(text) {
   const rx = new RegExp(`(?<![\\p{L}])(${PERSONAL_LABELS})[ \\t]*:[ \\t]*([^\\n]{1,80}?)[ \\t]*(?=\\n|$|[ \\t]{3,}|[,;]|[ \\t]+[\\p{L}][\\p{L}\\-.]*[ \\t]*:)`, 'gud');
-  return [...text.matchAll(rx)].map((m) => ({ start: m.indices[2][0], end: m.indices[2][1], label: m[1] }));
+  const out = [...text.matchAll(rx)].map((m) => ({ start: m.indices[2][0], end: m.indices[2][1], label: m[1] }));
+  // „Diagnosen:“ allein in der Zeile → die folgenden Zeilen (bis Leerzeile oder nächste Beschriftung)
+  const head = new RegExp(`(?<![\\p{L}])(${PERSONAL_LABELS})[ \\t]*:[ \\t]*\\n`, 'gu');
+  for (const m of text.matchAll(head)) {
+    let pos = m.index + m[0].length, end = -1;
+    for (let n = 0; n < 8; n++) {
+      const lineEnd = text.indexOf('\n', pos) < 0 ? text.length : text.indexOf('\n', pos);
+      const line = text.slice(pos, lineEnd);
+      if (!line.trim() || /^[\p{L}][\p{L} ,\-]{0,40}:/u.test(line.trim()) || line.length > 120) break;
+      end = pos + line.trimEnd().length;
+      pos = lineEnd + 1;
+      if (lineEnd >= text.length) break;
+    }
+    if (end > 0) out.push({ start: m.index + m[0].length, end, label: m[1] });
+  }
+  return out;
 }
 
 /** Längere Ziffernfolgen, die sonst nirgends zugeordnet wurden (Vorgangs-, Kunden-, Policen-Nummern …). */
 function findLongNumbers(text) {
   const out = [];
-  for (const m of text.matchAll(/(?<![\p{L}\p{N}])[A-Z]{0,3}\d(?:[\d\-\/]|[ .](?=\d))*\d(?![\p{L}\p{N}])/gu)) {
+  for (const m of text.matchAll(/(?<![\p{L}\p{N}])[A-Z]{0,3}\d(?:[\d\-\/]|[ .](?=\d)|[ ][A-Z]{1,2}[ ](?=\d))*\d(?![\p{L}\p{N}])/gu)) {
     if ((m[0].match(/\d/g) || []).length >= 6) out.push({ start: m.index, end: m.index + m[0].length });
   }
   return out;

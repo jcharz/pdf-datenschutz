@@ -47,6 +47,7 @@ export const STREETS = [
 ];
 
 export const CITIES = [
+  'Bonn', 'Ulm', 'Kiel', 'Hof', 'Jena', 'Gera', 'Celle', 'Fulda', 'Lahr', 'Linz', 'Mainz', 'Soest', 'Moers', 'Hagen', 'Unna', 'Wesel',
   'Altdorf', 'Bergheim', 'Birkenfeld', 'Blumenthal', 'Eichstetten', 'Felsberg', 'Grünstadt', 'Hainburg', 'Heidenau',
   'Hochdorf', 'Kirchberg', 'Lindau', 'Marienfeld', 'Neustadt', 'Rosenthal', 'Schönau', 'Sonnenberg', 'Steinbach',
   'Talheim', 'Waldkirch', 'Weidenau', 'Wiesental',

@@ -18,7 +18,43 @@ function separator(prev, it) {
   if (!horizontal) return ' ';
   if (Math.abs(it.transform[5] - prev.transform[5]) > fs * 0.5) return '\n';
   const gap = it.transform[4] - (prev.transform[4] + prev.width * Math.sign(a || 1));
+  // Großer Abstand = andere Spalte (Infoblock neben Adresse, Tabellenzellen) → eigene Zeile
+  if (gap > fs * 2.2 || gap < -fs) return '\n';
   return gap > fs * 0.15 ? ' ' : '';
+}
+
+/**
+ * Zeilen (bzw. Spaltenabschnitte) einer Seite mit Lage: x0/x1/y in PDF-Punkten, y von oben gemessen.
+ * Zeilen aus Formularfeldern/Kommentaren haben keine Lage (x0 = null).
+ */
+function buildLines(text, map, items, view) {
+  const [vx0, , , vy1] = view;
+  const lines = [];
+  let start = 0;
+  for (let i = 0; i <= text.length; i++) {
+    if (i < text.length && text[i] !== '\n') continue;
+    let s = start, e = i;
+    while (s < e && /\s/.test(text[s])) s++;
+    while (e > s && /\s/.test(text[e - 1])) e--;
+    if (e > s) {
+      const its = new Set();
+      for (let k = s; k < e; k++) if (map[k] && map[k][0] >= 0) its.add(map[k][0]);
+      const geo = [...its].map((n) => items[n]);
+      if (geo.length) {
+        const sizes = geo.map((it) => Math.hypot(it.transform[2], it.transform[3]) || it.height || 10);
+        const first = items[map[s]?.[0]] || geo[0];
+        lines.push({
+          start: s, end: e, text: text.slice(s, e),
+          x0: first.transform[4] - vx0,
+          x1: Math.max(...geo.map((it) => it.transform[4] + it.width)) - vx0,
+          y: vy1 - first.transform[5],
+          size: Math.max(...sizes),
+        });
+      } else lines.push({ start: s, end: e, text: text.slice(s, e), x0: null, x1: null, y: null, size: 0 });
+    }
+    start = i + 1;
+  }
+  return lines;
 }
 
 /**
@@ -37,6 +73,9 @@ export async function buildPageModel(page) {
   for (const it of tc.items) {
     if (it.str === undefined) continue;
     if (!it.str) { if (it.hasEOL && text && !text.endsWith('\n')) push('\n'); prev = null; continue; }
+    // pdf.js füllt Lücken zwischen Spalten mit einem breiten Leerzeichen → als Spaltenwechsel behandeln
+    const fs0 = Math.hypot(it.transform[2], it.transform[3]) || it.height || 10;
+    if (!it.str.trim() && it.width > fs0 * 2.2) { if (text && !text.endsWith('\n')) push('\n'); prev = null; continue; }
     const idx = items.length;
     items.push(it);
     if (prev) push(separator(prev, it));
@@ -62,7 +101,11 @@ export async function buildPageModel(page) {
     for (let k = 0; k < s.length; k++) { text += s[k]; map.push([-1 - ai, k]); }
   }
 
-  return { text, map, items, styles: tc.styles, annots, hasAnnots };
+  const [vx0, vy0, vx1, vy1] = page.view;
+  return {
+    text, map, items, styles: tc.styles, annots, hasAnnots,
+    width: vx1 - vx0, height: vy1 - vy0, lines: buildLines(text, map, items, page.view),
+  };
 }
 
 /** Viereck (4 Punkte, PDF-Koordinaten) für Zeichen [c0, c1) eines Textelements. */

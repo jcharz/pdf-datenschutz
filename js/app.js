@@ -1,11 +1,13 @@
 // Ablauf der App: PDF öffnen → automatisch prüfen → pro Fund entscheiden → anwenden → vergleichen → speichern.
 
 import * as pdfjsLib from '../vendor/pdfjs/pdf.min.mjs';
-import { scanDocument, parseCommand, findMatches, valueKey, normalize, SHORT } from './detect.js';
+import { parseCommand, findMatches, valueKey, normalize, SHORT } from './detect.js';
 import { buildPageModel, segmentsForRange, findImages } from './pdfmodel.js';
+import { analyzeDocument } from './structure.js';
 import { redactPdf, verifyResult } from './redact.js';
 import { PageViewer } from './viewer.js';
 import { PseudonymTable, Pseudonymizer } from './pseudo.js';
+import { TemplateStore, fingerprint, findingSignature, typeKey, hintHash, findHashedTerms } from './templates.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('../vendor/pdfjs/pdf.worker.min.mjs', import.meta.url).href;
 const PDF_OPTS = {
@@ -25,8 +27,8 @@ const ui = {
   body: $('sheetBody'), verify: $('verify'), hintForm: $('hintForm'), hintInput: $('hintInput'),
   filters: $('filters'), bulk: $('bulk'), list: $('findings'),
   saveDlg: $('saveDlg'), saveName: $('saveName'), saveHint: $('saveHint'),
-  settings: $('settings'), btnSettings: $('btnSettings'), setDefault: $('setDefault'), setLow: $('setLow'),
-  setDpi: $('setDpi'), setRasterAll: $('setRasterAll'), tableBox: $('tableBox'),
+  settings: $('settings'), btnSettings: $('btnSettings'), setDefault: $('setDefault'), setLow: $('setLow'), setSender: $('setSender'),
+  setDpi: $('setDpi'), setRasterAll: $('setRasterAll'), tableBox: $('tableBox'), templateBox: $('templateBox'),
   btnExport: $('btnExport'), btnImport: $('btnImport'), btnClearTable: $('btnClearTable'), importInput: $('importInput'),
   toast: $('toast'),
 };
@@ -46,11 +48,14 @@ const state = {
   view: 'original',
   filter: 'alle',
   busy: false,
+  hints: [], // angewendete Hinweise (für Schablonen)
+  templateOffer: null, // { template, score, dismissed, applied }
+  templateId: null,
 };
 
 const SETTINGS_KEY = 'pdfprivacy.settings';
 const settings = (() => {
-  const def = { defaultAction: 'redact', preselectLow: false, dpi: 200, rasterAll: false };
+  const def = { defaultAction: 'redact', preselectLow: false, preselectSender: false, dpi: 200, rasterAll: false };
   try { return { ...def, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') }; } catch { return def; }
 })();
 function storeSettings() {
@@ -58,11 +63,12 @@ function storeSettings() {
 }
 
 const table = new PseudonymTable();
+const templates = new TemplateStore();
 let pseudo = new Pseudonymizer(table);
 
 const viewer = new PageViewer(ui.viewer, {
   onChange: renderToolbar,
-  onTapShape: (id) => { const f = findingByShape(id); if (f) focusFinding(f); },
+  onTapShape: (id) => { const f = findingByShape(id); if (f) { state.focusId = f.id; renderOverlays(); focusFinding(f); } },
   onDraw: addManualArea,
 });
 
@@ -136,7 +142,7 @@ async function openFile(file, handle = null) {
 
     await clearResult();
     await state.doc?.destroy();
-    Object.assign(state, { file: { name: file.name || 'dokument.pdf', bytes, handle }, doc, models: [], findings: [], notices: [], filter: 'alle' });
+    Object.assign(state, { file: { name: file.name || 'dokument.pdf', bytes, handle }, doc, models: [], findings: [], notices: [], filter: 'alle', hints: [], templateOffer: null, templateId: null });
     pseudo = new Pseudonymizer(table);
     ui.fileName.textContent = state.file.name;
     ui.empty.hidden = true;
@@ -161,6 +167,7 @@ function texts() {
 
 function defaultAction(f) {
   if (f.cat === 'image') return 'keep';
+  if (f.owner === 'sender' && !settings.preselectSender) return 'keep';
   if (f.known) return 'replace';
   if (f.risk === 'niedrig' && !settings.preselectLow) return 'keep';
   return settings.defaultAction;
@@ -177,7 +184,7 @@ function makeFinding(base) {
 }
 
 async function analyze() {
-  const found = scanDocument(texts()).map((g) => makeFinding(g));
+  const found = analyzeDocument(state.models).map((g) => makeFinding(g));
 
   // Bilder: mögliche Unterschriften, Fotos, Stempel; ganzseitige Bilder = Scan
   for (let i = 0; i < state.doc.numPages; i++) {
@@ -204,8 +211,13 @@ async function analyze() {
   for (const f of found) {
     await pseudo.prepare(f);
     f.action = defaultAction(f);
+    f.sigBase = await findingSignature(f, state.models, table.data.salt);
   }
   state.findings = found;
+  // Bekanntes Formular? Dann die gespeicherte Bearbeitung anbieten
+  const fp = await fingerprint(state.models, found, table.data.salt);
+  const match = templates.match(fp);
+  state.templateOffer = match ? { template: match.template, score: match.score } : null;
   changed();
   if (!isDesktop() && found.length) openSheet(true);
 }
@@ -220,16 +232,78 @@ function setAction(f, action) {
   changed();
 }
 
-async function addManualArea(page, quad) {
+/** Gleiche Merkmale (z. B. mehrere Datumszellen einer Tabelle) nach Reihenfolge unterscheiden. */
+function assignSignatures() {
+  const pos = (f) => { const o = f.occurrences[0] || {}; return (o.page || 0) * 1e7 + (o.start ?? 0); };
+  const seen = new Map();
+  for (const f of [...state.findings].sort((a, b) => pos(a) - pos(b))) {
+    if (!f.sigBase) continue;
+    const k = seen.get(f.sigBase) || 0;
+    seen.set(f.sigBase, k + 1);
+    f.sig = `${f.sigBase}#${k}`;
+  }
+}
+
+function manualFinding(page, quad) {
   const n = state.findings.filter((f) => f.cat === 'manual').length + 1;
+  const m = state.models[page];
+  const xs = quad.map((p) => p[0]), ys = quad.map((p) => p[1]);
   const f = makeFinding({
-    cat: 'manual', label: 'Markierter Bereich', risk: 'hoch', value: `Bereich ${n} auf Seite ${page + 1}`,
+    cat: 'manual', label: 'Markierter Bereich', risk: 'hoch', owner: 'person', value: `Bereich ${n} auf Seite ${page + 1}`,
     occurrences: [{ page, segments: [{ quad }], text: '' }],
+    // Lage relativ zur Seite – für Schablonen
+    rel: [Math.min(...xs) / m.width, Math.min(...ys) / m.height, Math.max(...xs) / m.width, Math.max(...ys) / m.height],
   });
   f.action = 'redact';
+  return f;
+}
+
+async function addManualArea(page, quad) {
+  const f = manualFinding(page, quad);
+  f.sigBase = await findingSignature(f, state.models, table.data.salt);
   state.findings.unshift(f);
   changed();
   toast('Bereich wird geschwärzt. Weitere Bereiche ziehen oder ▭ beenden.');
+}
+
+/**
+ * Treffer eines Hinweises übernehmen: vorhandene Funde aktivieren bzw. behalten, neue Funde anlegen.
+ * hits: [{page, start, end, text}], cat: Kategorie oder 'hint'.
+ */
+async function applyHits(hits, { cat = 'hint', keep = false } = {}) {
+  let added = 0, changedCount = 0;
+  if (keep) {
+    for (const f of state.findings) {
+      const hit = (cat !== 'hint' && f.cat === cat) || hits.some((h) => f.occurrences.some((o) => o.page === h.page && o.start < h.end && h.start < o.end));
+      if (hit && f.action !== 'keep') { f.action = 'keep'; changedCount++; }
+    }
+    return { added, changedCount };
+  }
+  const fresh = [];
+  for (const h of hits) {
+    const owner = state.findings.find((f) => f.occurrences.some((o) => o.page === h.page && o.start < h.end && h.start < o.end));
+    if (owner) {
+      if (owner.action === 'keep') { owner.action = owner.fake && settings.defaultAction === 'replace' ? 'replace' : 'redact'; changedCount++; }
+    } else fresh.push(h);
+  }
+  const groups = new Map();
+  for (const h of fresh) {
+    const key = valueKey(cat, h.text);
+    if (!groups.has(key)) groups.set(key, { cat, label: cat !== 'hint' ? SHORT[cat] : 'Dein Hinweis', risk: 'hoch', owner: 'person', occurrences: [] });
+    groups.get(key).occurrences.push({ page: h.page, start: h.start, end: h.end, text: h.text });
+  }
+  for (const g of groups.values()) {
+    const vals = [...new Set(g.occurrences.map((o) => o.text.replace(/\s+/g, ' ').trim()))];
+    g.value = vals.reduce((a, b) => (b.length > a.length ? b : a));
+    g.variants = vals.filter((v) => v !== g.value);
+    const f = makeFinding(g);
+    await pseudo.prepare(f);
+    f.action = f.known ? 'replace' : settings.defaultAction === 'replace' && f.fake ? 'replace' : 'redact';
+    f.sigBase = await findingSignature(f, state.models, table.data.salt);
+    state.findings.unshift(f);
+    added++;
+  }
+  return { added, changedCount };
 }
 
 /** Hinweise des Nutzers: zusätzliche Begriffe/Kategorien oder „behalte …“. */
@@ -245,46 +319,114 @@ async function applyHint(text) {
   let added = 0, changedCount = 0;
   for (const rule of cmd.rules) {
     const hits = findMatches(rule, texts());
-    if (keepMatch) {
-      for (const f of state.findings) {
-        const hit = rule.kind === 'category' ? f.cat === rule.cat
-          : normalize(f.value).includes(normalize(rule.term)) || hits.some((h) => f.occurrences.some((o) => o.page === h.page && o.start < h.end && h.start < o.end));
-        if (hit && f.action !== 'keep') { f.action = 'keep'; changedCount++; }
-      }
-      continue;
-    }
-    const fresh = [];
-    for (const h of hits) {
-      const owner = state.findings.find((f) => f.occurrences.some((o) => o.page === h.page && o.start < h.end && h.start < o.end));
-      if (owner) {
-        if (owner.action === 'keep') { owner.action = owner.fake && settings.defaultAction === 'replace' ? 'replace' : 'redact'; changedCount++; }
-      } else fresh.push(h);
-    }
-    // Neue Treffer nach Wert zusammenfassen
-    const groups = new Map();
-    for (const h of fresh) {
-      const cat = rule.kind === 'category' ? rule.cat : 'hint';
-      const key = valueKey(cat, h.text);
-      if (!groups.has(key)) groups.set(key, { cat, label: rule.kind === 'category' ? SHORT[cat] : 'Dein Hinweis', risk: 'hoch', occurrences: [] });
-      groups.get(key).occurrences.push({ page: h.page, start: h.start, end: h.end, text: h.text });
-    }
-    for (const g of groups.values()) {
-      const vals = [...new Set(g.occurrences.map((o) => o.text.replace(/\s+/g, ' ').trim()))];
-      g.value = vals.reduce((a, b) => (b.length > a.length ? b : a));
-      g.variants = vals.filter((v) => v !== g.value);
-      const f = makeFinding(g);
-      await pseudo.prepare(f);
-      f.action = f.known ? 'replace' : settings.defaultAction === 'replace' && f.fake ? 'replace' : 'redact';
-      state.findings.unshift(f);
-      added++;
-    }
+    const cat = rule.kind === 'category' ? rule.cat : 'hint';
+    const r = await applyHits(hits, { cat, keep: !!keepMatch });
+    added += r.added;
+    changedCount += r.changedCount;
+    // Für Schablonen merken – Begriffe nur als Fingerabdruck
+    state.hints.push(rule.kind === 'category'
+      ? { kind: 'cat', cat: rule.cat, keep: !!keepMatch }
+      : { kind: 'term', hash: await hintHash(rule.term, table.data.salt), words: rule.term.trim().split(/\s+/).length, keep: !!keepMatch });
   }
   ui.hintInput.value = '';
   state.filter = 'alle';
   changed();
   if (added || changedCount) toast(keepMatch ? `${changedCount} Fund(e) bleiben unverändert.` : `${added} neue Fund(e)${changedCount ? `, ${changedCount} geändert` : ''}.`);
   else toast('Dazu wurde im Dokument nichts gefunden.');
-  if (added) ui.list.firstElementChild?.scrollIntoView({ block: 'nearest' });
+  if (added) ui.list.querySelector('.finding')?.scrollIntoView({ block: 'nearest' });
+}
+
+// ---------------------------------------------------------------------------
+// Bearbeitungsschablonen
+// ---------------------------------------------------------------------------
+
+/** Vorschlag für den Namen: Absender + Überschrift, ohne Zahlen. */
+function guessTemplateName() {
+  const sender = state.findings.find((f) => f.cat === 'block' && f.owner === 'sender');
+  let org = sender ? sender.value.split('\n')[0].split(/\s[·|•]\s|,\s/)[0] : '';
+  const m = state.models[0];
+  const lines = (m?.lines || []).filter((l) => l.x0 !== null && /\p{L}{4}/u.test(l.text) && l.y < m.height * 0.5);
+  const heading = lines.filter((l) => !state.findings.some((f) => f.occurrences.some((o) => o.page === 0 && o.start < l.end && l.start < o.end)))
+    .sort((a, b) => b.size - a.size)[0];
+  const clean = (t) => (t || '').replace(/\d[\d./-]*/g, '').replace(/\s+/g, ' ').trim();
+  org = clean(org);
+  const head = clean(heading?.text);
+  return [org, head].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i).join(' – ').slice(0, 70) || 'Meine Schablone';
+}
+
+function renderTemplateOffer() {
+  const o = state.templateOffer;
+  if (!o || o.dismissed) return [];
+  if (o.applied) {
+    return [el('li', { class: 'offer' }, el('b', {}, `✓ Schablone „${o.template.name}“ angewendet`),
+      `${o.applied} Schritte übernommen. Bitte kurz prüfen – neue Funde behalten ihren Vorschlag.`)];
+  }
+  return [el('li', { class: 'offer' },
+    el('b', {}, `Bekanntes Formular: „${o.template.name}“`),
+    `${Math.round(o.score * 100)} % Übereinstimmung. Soll die gespeicherte Bearbeitung (${Object.keys(o.template.rules).length + o.template.areas.length + o.template.hints.length} Schritte) übernommen werden?`,
+    el('div', { class: 'row' },
+      el('button', { type: 'button', class: 'btn primary', onclick: () => applyTemplate(o.template) }, 'Schablone anwenden'),
+      el('button', { type: 'button', class: 'btn', onclick: () => { o.dismissed = true; renderList(); } }, 'Nein'),
+    ),
+  )];
+}
+
+async function applyTemplate(t) {
+  let n = 0;
+  assignSignatures();
+  for (const f of state.findings) {
+    const rule = (f.sig && t.rules[f.sig]) || (f.sigBase && t.baseRules?.[f.sigBase]) || null;
+    const action = rule?.action || t.types[typeKey(f)];
+    if (!action) continue;
+    if (rule?.owner) f.owner = rule.owner;
+    f.action = action === 'replace' && !f.fake ? 'redact' : action;
+    n++;
+  }
+  for (const a of t.areas || []) {
+    const m = state.models[a.page];
+    if (!m) continue;
+    const [x0, y0, x1, y1] = [a.rel[0] * m.width, a.rel[1] * m.height, a.rel[2] * m.width, a.rel[3] * m.height];
+    const f = manualFinding(a.page, [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]);
+    f.sigBase = await findingSignature(f, state.models, table.data.salt);
+    state.findings.unshift(f);
+    n++;
+  }
+  const terms = (t.hints || []).filter((h) => h.kind === 'term');
+  if (terms.length) {
+    const hits = await findHashedTerms(texts(), terms, table.data.salt);
+    for (const keep of [false, true]) {
+      const r = await applyHits(hits.filter((h) => !!h.keep === keep), { keep });
+      n += r.added + r.changedCount;
+    }
+  }
+  for (const h of (t.hints || []).filter((x) => x.kind === 'cat')) {
+    const r = await applyHits(findMatches({ kind: 'category', cat: h.cat }, texts()), { cat: h.cat, keep: h.keep });
+    n += r.added + r.changedCount;
+  }
+  state.hints = [...(t.hints || [])];
+  state.templateId = t.id;
+  templates.touch(t.id);
+  state.templateOffer = { template: t, applied: n };
+  changed();
+  toast(`Schablone angewendet: ${n} Schritte.`);
+}
+
+async function saveTemplate() {
+  const existing = state.templateId && templates.get(state.templateId);
+  let id = null, name;
+  if (existing && confirm(`Schablone „${existing.name}“ mit dieser Bearbeitung aktualisieren?\n\n(Abbrechen = als neue Schablone speichern)`)) {
+    id = existing.id;
+    name = existing.name;
+  } else {
+    name = prompt('Name der Schablone (z. B. Absender und Dokumentart):', guessTemplateName());
+    if (!name) return;
+  }
+  assignSignatures();
+  const fp = await fingerprint(state.models, state.findings, table.data.salt);
+  const t = templates.upsert({ id, name: name.trim(), fp, findings: state.findings, hints: state.hints });
+  state.templateId = t.id;
+  toast(`Schablone „${t.name}“ gespeichert. Beim nächsten Dokument dieser Art wird sie angeboten.`, 4500);
+  renderReport();
 }
 
 // ---------------------------------------------------------------------------
@@ -326,25 +468,30 @@ function renderSummary() {
   ui.primary.disabled = state.busy || (!done && !c.redact && !c.replace);
 }
 
-const RISK_ORDER = ['hoch', 'mittel', 'niedrig'];
+const OWNER_FILTERS = [['alle', 'Alle'], ['person', 'Deine Daten'], ['sender', 'Absender']];
+const ownerOfFinding = (f) => f.owner || 'person';
 
 function renderList() {
-  // Filter
-  const by = (r) => state.findings.filter((f) => f.risk === r).length;
+  const count = (k) => state.findings.filter((f) => k === 'alle' || ownerOfFinding(f) === k).length;
   ui.filters.replaceChildren(
-    ...[['alle', `Alle ${state.findings.length}`], ...RISK_ORDER.map((r) => [r, `${r[0].toUpperCase() + r.slice(1)} ${by(r)}`])]
-      .filter(([k]) => k === 'alle' || by(k))
-      .map(([k, label]) => el('button', {
-        type: 'button', class: state.filter === k ? 'on' : '',
-        onclick: () => { state.filter = k; renderList(); },
-      }, k !== 'alle' ? el('span', { class: 'dot', style: `background: var(--${k === 'hoch' ? 'high' : k === 'mittel' ? 'mid' : 'low'})` }) : null, label)),
+    ...OWNER_FILTERS.filter(([k]) => k === 'alle' || count(k)).map(([k, label]) => el('button', {
+      type: 'button', class: state.filter === k ? 'on' : '',
+      onclick: () => { state.filter = k; renderList(); },
+    }, `${label} ${count(k)}`)),
   );
   ui.bulk.hidden = state.findings.length < 2;
 
-  const visible = state.findings.filter((f) => state.filter === 'alle' || f.risk === state.filter);
+  const visible = state.findings.filter((f) => state.filter === 'alle' || ownerOfFinding(f) === state.filter);
+  const person = visible.filter((f) => ownerOfFinding(f) === 'person');
+  const sender = visible.filter((f) => ownerOfFinding(f) === 'sender');
   ui.list.replaceChildren(
+    ...renderTemplateOffer(),
     ...state.notices.map((t) => el('li', { class: 'notice' }, '⚠︎ ', t)),
-    ...visible.map(renderFinding),
+    person.length && sender.length ? el('li', { class: 'section' }, `Deine Daten · ${person.length}`) : null,
+    ...person.map(renderFinding),
+    sender.length ? el('li', { class: 'section' }, `Absender & Organisationen · ${sender.length}`,
+      el('span', { class: 'hint' }, settings.preselectSender ? '' : 'standardmäßig behalten')) : null,
+    ...sender.map(renderFinding),
   );
   if (!state.findings.length && state.doc) {
     ui.list.append(el('li', { class: 'nothing' }, 'Keine kritischen Daten erkannt. Ergänze per Hinweis oder markiere Bereiche mit ▭.'));
@@ -353,17 +500,19 @@ function renderList() {
 
 function renderFinding(f) {
   const where = [...new Set(f.occurrences.map((o) => o.page + 1))];
-  const times = f.occurrences.length;
+  const times = f.cat === 'block' ? f.instances || 1 : f.occurrences.length;
   const canReplace = !!f.fake;
+  const sender = ownerOfFinding(f) === 'sender';
   const actions = [['redact', 'Schwärzen'], ...(canReplace ? [['replace', 'Ersetzen']] : []), ['keep', f.cat === 'manual' ? 'Entfernen' : 'Behalten']];
-  return el('li', { class: `finding r-${f.risk}`, dataset: { id: f.id } },
+  const mono = /\d/.test(f.value) && f.cat !== 'block' && f.occurrences[0].text;
+  return el('li', { class: `finding r-${sender ? 'sender' : f.risk}${f.cat === 'block' ? ' block' : ''}`, dataset: { id: f.id } },
     el('div', { class: 'meta' },
-      el('span', { class: 'risk' }, f.risk),
+      el('span', { class: 'risk' }, sender ? 'Absender' : f.risk),
       el('span', {}, f.label),
       el('span', { class: 'where' }, `S. ${where.join(', ')}${times > 1 ? ` · ${times}×` : ''}`),
     ),
     el('button', {
-      type: 'button', class: `value${/\d/.test(f.value) && f.occurrences[0].text ? '' : ' text'}`, title: 'Im Dokument zeigen',
+      type: 'button', class: `value${mono ? '' : ' text'}`, title: 'Im Dokument zeigen',
       onclick: () => showInDocument(f),
     }, f.value),
     f.variants.length ? el('div', { class: 'variants' }, `auch: ${f.variants.join(' · ')}`) : null,
@@ -374,18 +523,37 @@ function renderFinding(f) {
         onclick: () => (f.cat === 'manual' && a === 'keep' ? removeFinding(f) : setAction(f, a)),
       }, label)),
     ),
-    f.action === 'replace' ? el('div', { class: 'fake' },
-      el('span', { class: 'arrow' }, '→'),
+    canReplace ? el('div', { class: `fake${f.action === 'replace' ? '' : ' off'}` },
+      el('span', { class: 'arrow' }, f.action === 'replace' ? 'wird zu' : 'Ersatz wäre'),
       el('code', {}, f.fake),
       f.known ? el('span', { class: 'known', title: 'Aus deiner Pseudonym-Tabelle' }, 'bekannt') : null,
-      el('button', { type: 'button', class: 'dice', 'aria-label': 'Anderen Ersatzwert erzeugen', onclick: () => { pseudo.regenerate(f); refreshNameFakes(); changed(); } }, '🎲'),
+      el('button', { type: 'button', class: 'dice', 'aria-label': 'Anderen Ersatzwert erzeugen', onclick: () => regenerateFake(f) }, '🎲'),
     ) : null,
+    ['manual', 'image'].includes(f.cat) ? null : el('button', {
+      type: 'button', class: 'owner-switch', onclick: () => switchOwner(f),
+    }, sender ? '↺ Gehört zu meinen Daten' : '↺ Gehört zum Absender'),
   );
 }
 
-/** Nach dem Neu-Würfeln eines Namens die anderen Namen (gleiche Bestandteile) aktualisieren. */
-function refreshNameFakes() {
-  for (const f of state.findings) if (pseudo.kindOf(f) === 'name') f.fake = pseudo.nameReplace(f.value);
+async function regenerateFake(f) {
+  await pseudo.regenerate(f);
+  await refreshFakes();
+  changed();
+}
+
+/** Nach dem Neu-Würfeln: alle Funde mit gleichen Bestandteilen (Namen, Adressen) neu zusammensetzen. */
+async function refreshFakes() {
+  for (const f of state.findings) {
+    if (f.cat === 'block') await pseudo.prepareBlock(f);
+    else if (pseudo.kindOf(f) === 'name') f.fake = pseudo.nameReplace(f.value);
+  }
+}
+
+function switchOwner(f) {
+  f.owner = ownerOfFinding(f) === 'sender' ? 'person' : 'sender';
+  f.action = defaultAction(f);
+  changed();
+  toast(f.owner === 'sender' ? 'Als Absenderdaten markiert.' : 'Als deine Daten markiert.');
 }
 
 function removeFinding(f) {
@@ -397,7 +565,15 @@ function renderOverlays() {
   const shapes = [];
   if (state.view === 'original') {
     for (const f of state.findings) {
-      for (const o of f.occurrences) for (const quad of o.quads) shapes.push({ page: o.page, quad, cls: `hit ${f.action}`, id: f.id });
+      for (const o of f.occurrences) {
+        // Vorschau des Ersatzwerts als kleines Schild über der Stelle
+        // nur für den gerade angetippten Fund – sonst würden Schilder den Originaltext verdecken
+        const fake = f.id === state.focusId && f.action === 'replace' && o.text ? pseudo.fakeFor(f, o.text) : null;
+        o.quads.forEach((quad, i) => shapes.push({
+          page: o.page, quad, cls: `hit ${f.action}`, id: f.id,
+          tag: i === 0 && fake && fake !== o.text ? fake : null,
+        }));
+      }
     }
   }
   viewer.setOverlays(shapes);
@@ -408,7 +584,7 @@ function findingByShape(id) {
 }
 
 function focusFinding(f) {
-  if (state.filter !== 'alle' && state.filter !== f.risk) { state.filter = 'alle'; renderList(); }
+  if (state.filter !== 'alle' && state.filter !== ownerOfFinding(f)) { state.filter = 'alle'; renderList(); }
   openSheet(true);
   const li = ui.list.querySelector(`[data-id="${f.id}"]`);
   if (!li) return;
@@ -423,6 +599,8 @@ function showInDocument(f) {
   const i = ((revealIndex.get(f.id) ?? -1) + 1) % f.occurrences.length;
   revealIndex.set(f.id, i);
   const o = f.occurrences[i];
+  state.focusId = f.id;
+  renderOverlays();
   if (state.view !== 'original') setView('original');
   openSheet(false);
   viewer.reveal(o.page, o.quads[0], f.id);
@@ -472,9 +650,11 @@ async function applyAll() {
         const r = get(o.page);
         const area = f.cat === 'manual' || f.cat === 'image';
         if (area) { r.blockQuads.push(...o.quads); continue; }
+        const fake = f.action === 'replace' ? pseudo.fakeFor(f, o.text) : null;
+        if (fake !== null && fake === o.text) continue; // z. B. „Herrn“ im Adressblock bleibt stehen
         for (let i = o.start; i < o.end; i++) r.excluded.add(i);
         const replaceable = f.action === 'replace' && o.segments.some((s) => s.geom);
-        if (replaceable) r.replacements.push({ segments: o.segments, text: pseudo.fakeFor(f, o.text) });
+        if (replaceable) r.replacements.push(...splitAcrossLines(o, fake));
         else r.quads.push(...o.quads);
       }
     }
@@ -485,9 +665,11 @@ async function applyAll() {
     });
 
     busy('Prüfe das Ergebnis …');
-    const removedTexts = active.flatMap((f) => f.occurrences.map((o) => o.text)).filter(Boolean);
+    // Geprüft werden die eigentlichen Werte (bei Blöcken die erkannten Teile, z. B. Straße und Name)
+    const removedTexts = active.flatMap((f) => f.occurrences.flatMap((o) => (o.parts?.length ? o.parts.map((p) => p.text) : [o.text]))).filter(Boolean);
     const keptTexts = state.findings.filter((f) => f.action === 'keep').flatMap((f) => f.occurrences.map((o) => o.text))
-      .concat(active.filter((f) => f.action === 'replace').map((f) => f.fake || ''));
+      .concat(active.filter((f) => f.action === 'replace').flatMap((f) => (f.fake || '').split('\n')));
+    const replacements = active.filter((f) => f.action === 'replace' && f.fake).map((f) => [f.value, f.fake]);
     const report = await verifyResult({ pdfjsLib, bytes, rules: [], removedTexts, keptTexts });
 
     await pseudo.commit(active);
@@ -495,7 +677,7 @@ async function applyAll() {
 
     await clearResult();
     const doc = await pdfjsLib.getDocument({ ...PDF_OPTS, data: bytes.slice() }).promise;
-    state.result = { bytes, doc, report, stats };
+    state.result = { bytes, doc, report, stats, replacements };
     state.stale = false;
     ui.tabResult.disabled = false;
     ui.tabResult.classList.remove('stale');
@@ -511,6 +693,38 @@ async function applyAll() {
   }
 }
 
+/**
+ * Wert über mehrere Zeilen (z. B. umgebrochene IBAN): Ersatz zeilenweise aufteilen – gleiche Zeichenzahl je Zeile
+ * wie im Original. Passt die Struktur nicht (z. B. „[anonymisiert]“), steht der Ersatz komplett in der ersten Zeile.
+ */
+function splitAcrossLines(o, fake) {
+  const rows = [];
+  for (const seg of o.segments) {
+    const y = seg.geom?.baseline[1];
+    const row = rows.find((r) => y !== undefined && Math.abs(r.y - y) < (seg.geom.size || 10) * 0.5);
+    if (row) row.segments.push(seg); else rows.push({ y, segments: [seg] });
+  }
+  const origLines = o.text.split('\n').map((t) => t.trim()).filter(Boolean);
+  const alnum = (t) => (t.match(/[\p{L}\p{N}]/gu) || []).length;
+  if (rows.length < 2 || rows.length !== origLines.length || alnum(fake) !== alnum(o.text.replace(/\n/g, ' '))) {
+    return [{ segments: o.segments, text: fake }];
+  }
+  const parts = [];
+  let i = 0;
+  const flat = fake.replace(/\s+/g, ' ');
+  for (const line of origLines) {
+    let need = alnum(line), part = '';
+    while (i < flat.length && (need > 0 || !/[\p{L}\p{N}]/u.test(flat[i]))) {
+      if (need === 0) break;
+      if (/[\p{L}\p{N}]/u.test(flat[i])) need--;
+      part += flat[i++];
+    }
+    parts.push(part.trim());
+  }
+  parts[parts.length - 1] += flat.slice(i);
+  return rows.map((r, k) => ({ segments: r.segments, text: parts[k] }));
+}
+
 function renderReport() {
   const { report, stats } = state.result;
   ui.verify.hidden = false;
@@ -522,6 +736,19 @@ function renderReport() {
   if (report.leftInText.length) line('bad', `Noch im Text: ${report.leftInText.join(', ')}`);
   if (report.leftInRaw.length) line('bad', `Noch in PDF-Datenströmen: ${report.leftInRaw.join(', ')}`);
   line('small', `${stats.rasterized} Seite(n) neu aufgebaut, ${stats.copied} übernommen. Metadaten, Kommentare, Formulare, Lesezeichen und Anhänge wurden entfernt.`);
+  // Was wurde womit ersetzt?
+  const replaced = state.result.replacements || [];
+  if (replaced.length) {
+    ui.verify.append(el('details', { class: 'report-map', open: replaced.length <= 6 },
+      el('summary', {}, `Ersetzt (${replaced.length})`),
+      el('table', {}, el('tbody', {}, replaced.map(([from, to]) => el('tr', {}, el('td', {}, from), el('td', { class: 'to' }, `→ ${to}`))))),
+    ));
+  }
+  const existing = state.templateId && templates.get(state.templateId);
+  ui.verify.append(el('div', { class: 'actions-row' },
+    el('button', { type: 'button', class: 'btn small', onclick: saveTemplate },
+      existing ? `Schablone „${existing.name}“ aktualisieren` : '📋 Als Schablone merken'),
+  ));
 }
 
 async function clearResult() {
@@ -620,12 +847,27 @@ function renderTable() {
   )))));
 }
 
+function renderTemplates() {
+  const rows = templates.list();
+  if (!rows.length) {
+    ui.templateBox.replaceChildren(el('div', { class: 'none' }, 'Noch keine. Nach „Anwenden“ kannst du die Bearbeitung als Schablone merken.'));
+    return;
+  }
+  ui.templateBox.replaceChildren(el('table', {}, el('tbody', {}, rows.map((t) => el('tr', {},
+    el('td', {}, el('b', {}, t.name), el('br'),
+      el('span', { class: 'small' }, `${Object.keys(t.rules).length + t.areas.length + t.hints.length} Schritte · ${t.uses}× benutzt`)),
+    el('td', { class: 'x' }, el('button', { type: 'button', 'aria-label': 'Schablone löschen', onclick: () => { templates.remove(t.id); renderTemplates(); } }, '✕')),
+  )))));
+}
+
 function openSettings() {
   ui.setDefault.value = settings.defaultAction;
   ui.setLow.checked = settings.preselectLow;
+  ui.setSender.checked = settings.preselectSender;
   ui.setDpi.value = String(settings.dpi);
   ui.setRasterAll.checked = settings.rasterAll;
   renderTable();
+  renderTemplates();
   ui.settings.showModal();
 }
 
@@ -633,6 +875,7 @@ ui.settings.addEventListener('close', () => {
   const rasterChanged = settings.rasterAll !== ui.setRasterAll.checked || settings.dpi !== Number(ui.setDpi.value);
   settings.defaultAction = ui.setDefault.value;
   settings.preselectLow = ui.setLow.checked;
+  settings.preselectSender = ui.setSender.checked;
   settings.dpi = Number(ui.setDpi.value);
   settings.rasterAll = ui.setRasterAll.checked;
   storeSettings();
@@ -640,8 +883,9 @@ ui.settings.addEventListener('close', () => {
 });
 
 ui.btnExport.addEventListener('click', () => {
-  const blob = new Blob([table.export()], { type: 'application/json' });
-  const name = `pseudonym-tabelle-${new Date().toISOString().slice(0, 10)}.json`;
+  const backup = { ...JSON.parse(table.export()), templates: templates.items };
+  const blob = new Blob([JSON.stringify(backup, null, 1)], { type: 'application/json' });
+  const name = `pdf-datenschutz-sicherung-${new Date().toISOString().slice(0, 10)}.json`;
   const file = new File([blob], name, { type: 'application/json' });
   if (matchMedia('(pointer: coarse)').matches && navigator.canShare?.({ files: [file] })) {
     navigator.share({ files: [file] }).catch(() => {});
@@ -653,9 +897,12 @@ ui.btnExport.addEventListener('click', () => {
 ui.btnImport.addEventListener('click', () => { ui.importInput.value = ''; ui.importInput.click(); });
 ui.importInput.addEventListener('change', async () => {
   try {
-    table.import(await ui.importInput.files[0].text());
+    const json = await ui.importInput.files[0].text();
+    table.import(json);
+    templates.import(JSON.parse(json).templates);
     renderTable();
-    toast('Tabelle wiederhergestellt.');
+    renderTemplates();
+    toast('Sicherung wiederhergestellt.');
   } catch (e) { reportError(e, 'Wiederherstellen fehlgeschlagen.'); }
 });
 ui.btnClearTable.addEventListener('click', () => {
@@ -688,7 +935,7 @@ ui.bulk.addEventListener('click', (e) => {
   const a = e.target.dataset?.bulk;
   if (!a) return;
   for (const f of state.findings) {
-    if (state.filter !== 'alle' && f.risk !== state.filter) continue;
+    if (state.filter !== 'alle' && ownerOfFinding(f) !== state.filter) continue;
     if (a === 'replace' && !f.fake) continue;
     if (f.cat === 'manual' && a === 'keep') continue;
     f.action = a;
@@ -720,4 +967,4 @@ if ('serviceWorker' in navigator && location.protocol === 'https:') {
 }
 
 // Für automatisierte Tests
-window.__pdfPrivacy = { state, viewer, table, openFile, applyAll, applyHint, setAction };
+window.__pdfPrivacy = { state, viewer, table, templates, openFile, applyAll, applyHint, setAction, applyTemplate, saveTemplate };
