@@ -41,7 +41,9 @@ function buildLines(text, map, items, view) {
       for (let k = s; k < e; k++) if (map[k] && map[k][0] >= 0) its.add(map[k][0]);
       const geo = [...its].map((n) => items[n]);
       if (geo.length) {
-        const sizes = geo.map((it) => Math.hypot(it.transform[2], it.transform[3]) || it.height || 10);
+        // Schriftgröße der Zeile: nur Elemente mit Buchstaben/Ziffern (Satzzeichen aus Scans sind ungenau)
+        const sized = geo.filter((it) => /[\p{L}\p{N}]/u.test(it.str));
+        const sizes = (sized.length ? sized : geo).map((it) => Math.hypot(it.transform[2], it.transform[3]) || it.height || 10);
         const first = items[map[s]?.[0]] || geo[0];
         lines.push({
           start: s, end: e, text: text.slice(s, e),
@@ -104,7 +106,70 @@ export async function buildPageModel(page) {
   const [vx0, vy0, vx1, vy1] = page.view;
   return {
     text, map, items, styles: tc.styles, annots, hasAnnots,
-    width: vx1 - vx0, height: vy1 - vy0, lines: buildLines(text, map, items, page.view),
+    width: vx1 - vx0, height: vy1 - vy0, origin: [vx0, vy0], lines: buildLines(text, map, items, page.view),
+  };
+}
+
+/**
+ * Textmodell aus der Texterkennung (OCR) einer gescannten Seite – gleiche Form wie buildPageModel,
+ * damit Erkennung, Blöcke, Ersetzen und Prüfung genauso funktionieren. Jedes erkannte Wort wird
+ * zu einem „Textelement“ mit Lage im PDF-Koordinatensystem.
+ */
+export function buildOcrModel(page, base, ocr) {
+  const { lines: ocrLines, view } = ocr;
+  let text = '';
+  const map = [];
+  const items = [];
+  const push = (s) => { for (const ch of s) { text += ch; map.push(null); } };
+  for (const line of ocrLines) {
+    // Zeilenhöhe von der höchsten Oberlänge bis zur tiefsten Unterlänge; daraus Grundlinie und Schriftgröße
+    const top = Math.min(...line.words.map((w) => w.y0));
+    const bottom = Math.max(...line.words.map((w) => w.y1));
+    const H = Math.max(4, bottom - top);
+    const bl = line.baseline;
+    const baselineAt = (x) => (bl && bl.has_baseline !== false && bl.x1 !== bl.x0
+      ? bl.y0 + ((bl.y1 - bl.y0) * (x - bl.x0)) / (bl.x1 - bl.x0)
+      : bottom - H * 0.18);
+    // Wörter ohne Unterlängen sitzen direkt auf der Grundlinie → genaue Grundlinie und Großbuchstabenhöhe
+    const DESC = /[gjpqyQ,;()[\]{}|§µ]/;
+    const TALL = /[A-ZÄÖÜ0-9bdfhkltß!?/€]/;
+    // untere Mitte: ein einzelnes zu hohes Erkennungsfeld soll die Zeile nicht vergrößern
+    const lowMedian = (xs) => (xs.length ? [...xs].sort((a, b) => a - b)[Math.floor((xs.length - 1) / 2)] : null);
+    const capPx = lowMedian(line.words.filter((w) => !DESC.test(w.text) && TALL.test(w.text)).map((w) => w.y1 - w.y0));
+    let prev = null;
+    for (const w of line.words) {
+      // Grundlinie: Wörter ohne Unterlänge sitzen darauf; sonst Tesseract-Grundlinie an dieser Stelle (berücksichtigt Schräglage)
+      const by = !DESC.test(w.text) ? w.y1 : Math.min(w.y1, Math.max(w.y0 + (w.y1 - w.y0) * 0.5, baselineAt(w.x0)));
+      // groß genug, dass das Viereck (Grundlinie −0,45 … +1,15 Schriftgröße) das Wort sicher abdeckt
+      const punct = !/[\p{L}\p{N}]/u.test(w.text); // „-“, „·“, „«“: Lage ungenau, Größe von der Zeile nehmen
+      const fsPx = punct && capPx ? capPx / 0.72 : Math.max((by - w.y0) / 0.75, (capPx ?? (by - w.y0)) / 0.72, (w.y1 - w.y0) / 1.2);
+      const p0 = view.convertToPdfPoint(w.x0, by);
+      const p1 = view.convertToPdfPoint(w.x1, by);
+      const pt = view.convertToPdfPoint(w.x0, by - fsPx);
+      const ux = p1[0] - p0[0], uy = p1[1] - p0[1], len = Math.hypot(ux, uy) || 1;
+      const vx = pt[0] - p0[0], vy = pt[1] - p0[1], fs = Math.hypot(vx, vy) || 1;
+      const capTop = view.convertToPdfPoint(w.x0, by - (capPx ?? (by - w.y0)));
+      // eng anliegender Rahmen um das erkannte Wort (für das Überdecken beim Ersetzen)
+      const m = Math.max(2, (capPx ?? H) * 0.18);
+      const box = [[w.x0 - m, w.y1 + m], [w.x1 + m, w.y1 + m], [w.x1 + m, w.y0 - m], [w.x0 - m, w.y0 - m]].map(([x, y]) => view.convertToPdfPoint(x, y));
+      const it = {
+        str: w.text, width: len, height: fs, fontName: 'ocr', hasEOL: false, conf: w.conf,
+        cap: Math.hypot(capTop[0] - p0[0], capTop[1] - p0[1]), // Höhe der Großbuchstaben (für passenden Ersatztext)
+        box,
+        transform: [(ux / len) * fs, (uy / len) * fs, (vx / fs) * fs, (vy / fs) * fs, p0[0], p0[1]],
+      };
+      if (prev) push(w.x0 - prev.x1 > H * 2.2 ? '\n' : ' '); // große Lücke = andere Spalte
+      const idx = items.length;
+      items.push(it);
+      for (let k = 0; k < w.text.length; k++) { text += w.text[k]; map.push([idx, k]); }
+      prev = w;
+    }
+    push('\n');
+  }
+  return {
+    ...base, text, map, items, styles: { ocr: { fontFamily: 'sans-serif', vertical: false } },
+    lines: buildLines(text, map, items, page.view),
+    ocr: { words: items.length, confidence: items.length ? items.reduce((n, it) => n + (it.conf || 0), 0) / items.length : 0 },
   };
 }
 
@@ -124,9 +189,11 @@ function itemQuad(it, style, c0, c1) {
     f1 = measure(it.str.slice(0, c1), style?.fontFamily) / full;
   }
   // Großzügiger Rand: lieber etwas zu viel schwärzen als einen Buchstabenrest stehen lassen.
-  const pad = fs * 0.15;
+  // Bei Scans (OCR) noch mehr, weil die erkannte Lage ungenauer ist.
+  const ocr = it.fontName === 'ocr';
+  const pad = fs * (ocr ? 0.25 : 0.15);
   const x0 = f0 * W - pad, x1 = f1 * W + pad;
-  const y0 = -fs * 0.32, y1 = fs * 1.05;
+  const y0 = -fs * (ocr ? 0.45 : 0.32), y1 = fs * (ocr ? 1.15 : 1.05);
   const P = (x, y) => [e + ux * x + vx * y, f + uy * x + vy * y];
   return [P(x0, y0), P(x1, y0), P(x1, y1), P(x0, y1)];
 }
@@ -155,6 +222,7 @@ function itemGeometry(it, style, c0, c1) {
     size,
     angle: Math.atan2(b, a),
     family: style?.fontFamily || 'sans-serif',
+    cap: it.cap,
   };
 }
 
@@ -171,7 +239,21 @@ export function segmentsForRange(model, start, end) {
     else {
       const it = model.items[cur.item];
       const style = model.styles[it.fontName];
-      segs.push({ quad: itemQuad(it, style, cur.c0, cur.c1), geom: itemGeometry(it, style, cur.c0, cur.c1) });
+      const seg = { quad: itemQuad(it, style, cur.c0, cur.c1), geom: itemGeometry(it, style, cur.c0, cur.c1) };
+      if (it.box) {
+        // Scan: eng anliegende Fläche (nur das Wort bzw. der Wortteil) zum Überdecken beim Ersetzen
+        const [bl, br, tr, tl] = it.box;
+        // Satzzeichen direkt am Wort („Mustermann,“) mit überdecken und im Ersatz wieder anhängen
+        const pre = it.str.slice(0, cur.c0), post = it.str.slice(cur.c1);
+        const PUNCT = /^[.,;:!?)("»«'’\]\[-]*$/;
+        if (PUNCT.test(pre)) seg.prefix = pre;
+        if (PUNCT.test(post)) seg.suffix = post;
+        const f0 = seg.prefix !== undefined ? 0 : cur.c0 / it.str.length;
+        const f1 = seg.suffix !== undefined ? 1 : cur.c1 / it.str.length;
+        const lerp = (a, b, f) => [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f];
+        seg.fill = [lerp(bl, br, f0), lerp(bl, br, f1), lerp(tl, tr, f1), lerp(tl, tr, f0)];
+      }
+      segs.push(seg);
     }
     cur = null;
   };

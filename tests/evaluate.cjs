@@ -11,6 +11,7 @@ const { SAMPLES, makeDoc } = require('./samples.cjs');
 const ROOT = path.join(__dirname, '..');
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.webmanifest': 'application/manifest+json' };
 const verbose = process.argv.includes('--verbose');
+const only = (process.argv.find((a) => a.startsWith('--only=')) || '').slice(7);
 
 function serve() {
   return new Promise((res) => {
@@ -121,6 +122,7 @@ function evaluate(name, findings, exp) {
   const srv = await serve();
   const url = `http://localhost:${srv.address().port}/`;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'samples-'));
+  if (process.env.SHOW_DIR) console.log('Beispiele in', dir);
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
   const errors = [];
@@ -135,13 +137,58 @@ function evaluate(name, findings, exp) {
     await p2.close();
     return buf;
   })();
-  const all = [...SAMPLES, ['html-brief.pdf', null, EXPECT_HTML]];
-  for (const [name, build, exp] of all) {
+  // Gescannte Fassungen (nur Bilder, leicht schräg, mit Rauschen) – werden per Texterkennung gelesen
+  const scanOf = async (pdfBytes, { dpi = 200, angle = 0.006, noise = 30, bg = '#fbfaf6' } = {}) => {
+    const p3 = await browser.newPage();
+    await p3.goto(url);
+    const jpgs = await p3.evaluate(async ({ b64, dpi, angle, noise, bg }) => {
+      const pdfjs = await import('./vendor/pdfjs/pdf.min.mjs');
+      pdfjs.GlobalWorkerOptions.workerSrc = './vendor/pdfjs/pdf.worker.min.mjs';
+      const doc = await pdfjs.getDocument({ data: Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)) }).promise;
+      const out = [];
+      for (let i = 1; i <= doc.numPages; i++) {
+        const page = await doc.getPage(i);
+        const vp = page.getViewport({ scale: dpi / 72 });
+        const c = document.createElement('canvas');
+        c.width = vp.width; c.height = vp.height;
+        const ctx = c.getContext('2d');
+        ctx.fillStyle = bg; ctx.fillRect(0, 0, c.width, c.height);
+        ctx.translate(c.width / 2, c.height / 2); ctx.rotate(angle); ctx.translate(-c.width / 2, -c.height / 2);
+        await page.render({ canvasContext: ctx, viewport: vp }).promise;
+        const img = ctx.getImageData(0, 0, c.width, c.height);
+        for (let k = 0; k < img.data.length; k += 4) { const n = (Math.random() - 0.5) * noise; img.data[k] += n; img.data[k + 1] += n; img.data[k + 2] += n; }
+        ctx.putImageData(img, 0, 0);
+        out.push(c.toDataURL('image/jpeg', 0.8).split(',')[1]);
+      }
+      return out;
+    }, { b64: Buffer.from(pdfBytes).toString('base64'), dpi, angle, noise, bg });
+    await p3.close();
+    const { PDFDocument } = require('../vendor/pdf-lib/pdf-lib.min.js');
+    const doc = await PDFDocument.create();
+    for (const j of jpgs) {
+      const img = await doc.embedJpg(Buffer.from(j, 'base64'));
+      const pg = doc.addPage([595, 842]);
+      pg.drawImage(img, { x: 0, y: 0, width: 595, height: 842 });
+    }
+    return Buffer.from(await doc.save());
+  };
+  const scans = [];
+  for (const n of ['rechnung.pdf', 'kasse-a.pdf', 'mehrseitig.pdf']) {
+    const [, build, exp] = SAMPLES.find((x) => x[0] === n);
+    scans.push([`scan-${n}`, await scanOf(await makeDoc(build)), exp]);
+  }
+  // schwieriger: Handy-Scan mit 150 dpi, 1° schräg, grauem Hintergrund und mehr Rauschen
+  {
+    const [, build, exp] = SAMPLES.find((x) => x[0] === 'rechnung.pdf');
+    scans.push(['scan-handy-rechnung.pdf', await scanOf(await makeDoc(build), { dpi: 150, angle: 0.017, noise: 50, bg: '#e9e6df' }), exp]);
+  }
+  const all = [...SAMPLES, ['html-brief.pdf', null, EXPECT_HTML], ...scans];
+  for (const [name, build] of all) fs.writeFileSync(path.join(dir, name), Buffer.isBuffer(build) ? build : build ? await makeDoc(build) : htmlPdf);
+  for (const [name, build, exp] of all.filter(([n]) => !only || n.includes(only))) {
     const file = path.join(dir, name);
-    fs.writeFileSync(file, build ? await makeDoc(build) : htmlPdf);
     await page.evaluate(() => { window.__pdfPrivacy.state.findings = []; });
     await page.setInputFiles('#fileInput', file);
-    await page.waitForFunction((n) => window.__pdfPrivacy.state.file?.name === n && window.__pdfPrivacy.state.findings.length > 0, name, { timeout: 30000 });
+    await page.waitForFunction((n) => window.__pdfPrivacy.state.file?.name === n && window.__pdfPrivacy.state.findings.length > 0, name, { timeout: 180000 });
     await page.waitForTimeout(300);
     const findings = await page.evaluate(() => window.__pdfPrivacy.state.findings.map((f) => ({
       cat: f.cat, label: f.label, value: f.value, variants: f.variants, owner: f.owner, risk: f.risk, action: f.action, fake: f.fake,
@@ -167,7 +214,7 @@ function evaluate(name, findings, exp) {
         let t = '';
         for (let i = 1; i <= doc.numPages; i++) t += (await (await doc.getPage(i)).getTextContent()).items.map((x) => x.str).join('') + '\n';
         const rep = window.__pdfPrivacy.state.result.report;
-        return { t: t.replace(/\s+/g, ''), ok: rep.ok, left: [...rep.leftInText, ...rep.leftInRaw] };
+        return { t: t.replace(/\s+/g, ''), ok: rep.ok, left: [...rep.leftInText, ...rep.leftInRaw, ...(rep.leftInImage || []).map((x) => `Bild S.${x.page + 1}: ${x.text}`)] };
       });
       const shared = (exp.sharedWithSender || []).map(ws);
       const leaked = exp.person.filter((v) => !shared.includes(ws(v)) && out.t.includes(v.replace(/\s+/g, '')));
@@ -313,6 +360,27 @@ function evaluate(name, findings, exp) {
   await page.click('#verify .btn.primary', { force: true });
   await page.waitForFunction(() => window.__pdfPrivacy.state.result?.report.ok, null, { timeout: 60000 });
   check(!/A987654321/.test(await pdfText()), 'Nach „Diese Stellen auch entfernen“: Rest beseitigt, Prüfbericht ok');
+
+  // -------------------------------------------------------------------------
+  // Scan: zu kleine Schwärzung → Texterkennung auf dem Ergebnis findet den Rest → „Rest entfernen“
+  // -------------------------------------------------------------------------
+  console.log('\n=== Scan: Prüfung des Bildinhalts (scan-kasse-a.pdf)');
+  await open('scan-kasse-a.pdf');
+  await page.evaluate(() => {
+    const f = window.__pdfPrivacy.state.findings.find((x) => x.value === 'A123456789');
+    f.action = 'redact';
+    // Balken absichtlich viel zu schmal (nur das erste Zehntel)
+    for (const o of f.occurrences) o.quads = o.quads.map((q) => { const [a, b, c, d] = q; const k = 0.1; return [a, [a[0] + (b[0] - a[0]) * k, b[1]], [d[0] + (c[0] - d[0]) * k, c[1]], d]; });
+  });
+  await page.evaluate(() => window.__pdfPrivacy.applyAll());
+  await page.waitForFunction(() => window.__pdfPrivacy.state.result, null, { timeout: 180000 });
+  const rep1 = await page.evaluate(() => ({ ok: window.__pdfPrivacy.state.result.report.ok, img: window.__pdfPrivacy.state.result.report.leftInImage.map((x) => x.text) }));
+  check(!rep1.ok && rep1.img.includes('A123456789'), `Zu schmaler Balken erkannt: im Bild noch lesbar (${rep1.img.join(', ')})`);
+  await page.evaluate(() => { window.__pdfPrivacy.state.result.marker = 1; });
+  await page.click('#verify .btn.primary', { force: true });
+  await page.waitForFunction(() => window.__pdfPrivacy.state.result && !window.__pdfPrivacy.state.result.marker && !window.__pdfPrivacy.state.busy, null, { timeout: 180000 });
+  const rep2 = await page.evaluate(() => ({ ok: window.__pdfPrivacy.state.result.report.ok, r: JSON.stringify(window.__pdfPrivacy.state.result.report) }));
+  check(rep2.ok, `Nach „Rest entfernen“: Stelle nachgeschwärzt, Prüfung (inkl. Bild) ok ${rep2.ok ? '' : rep2.r}`);
   console.log(failed ? `  ${failed} Prüfung(en) fehlgeschlagen` : '  Alle Prüfungen bestanden');
   if (errors.length) console.log('JS-Fehler:', errors.join('; '));
   await browser.close();

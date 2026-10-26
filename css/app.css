@@ -100,6 +100,18 @@ polygon.hit.flash { animation: flash 1.2s ease-out 2; }
 g.tag { pointer-events: none; }
 g.tag rect { fill: #4f46e5; opacity: 0.92; }
 g.tag text { fill: #fff; font-family: -apple-system, "Segoe UI", sans-serif; font-weight: 600; }
+polygon.manual-area { fill: rgba(15, 23, 42, 0.55); stroke: #0f172a; }
+.viewer.marking polygon.manual-area { cursor: move; }
+rect.sel-frame { fill: none; stroke: #4f46e5; stroke-width: 2; vector-effect: non-scaling-stroke; stroke-dasharray: 5 3; }
+circle.handle { fill: #fff; stroke: #4f46e5; stroke-width: 2.5; vector-effect: non-scaling-stroke; }
+.markbar {
+  position: absolute; left: 10px; bottom: 10px; z-index: 5; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 14px; padding: 8px; box-shadow: 0 6px 20px rgba(15, 23, 42, 0.18); max-width: calc(100% - 20px);
+}
+.markbar .row { display: flex; gap: 6px; align-items: center; }
+.markbar .tool:disabled { opacity: 0.35; }
+.markbar .btn.primary { margin-left: 4px; }
+.markhint { font-size: 12px; color: var(--muted); margin-top: 6px; }
 rect.drawing { fill: rgba(79, 70, 229, 0.2); stroke: #4f46e5; stroke-width: 1; vector-effect: non-scaling-stroke; }
 
 /* Startbildschirm */
