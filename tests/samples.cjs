@@ -92,6 +92,8 @@ const expectKasse = (p) => ({
   blocks: [{ owner: 'person', contains: [p.name, p.strasse, p.ort] }],
   exact: { [p.kdnr]: 'Kundennummer', [p.vnr]: 'Versichertennummer' },
   notPerson: ['Leistungsabrechnung', 'Krankenhausbehandlung', 'Physiotherapie', 'Gesundheitskasse'],
+  // steht auch in der (behaltenen) Fußzeile der Krankenkasse: „Domstraße 1 · 50667 Köln“
+  sharedWithSender: p.ort === '50667 Köln' ? ['50667 Köln'] : [],
 });
 
 // ---------------------------------------------------------------------------
@@ -363,6 +365,45 @@ const expectZweiseitig = {
   notPerson: ['Angelegenheit', 'Forderung', 'Unterlagen'],
 };
 
+// ---------------------------------------------------------------------------
+// 11: Mehrseitig – eigene Nummer und Name auf Seite 2 in Kopf- und Fußzeile wiederholt
+// ---------------------------------------------------------------------------
+
+const mehrseitig = async ({ page, t, line }) => {
+  page();
+  t(380, 50, 'GKR Gesundheitskasse Rheinland', 11, true);
+  t(60, 128, 'GKR Gesundheitskasse Rheinland · Postfach 10 20 30 · 50450 Köln', 7);
+  line(60, 131, 300);
+  t(60, 150, 'Herrn', 10); t(60, 164, 'Jochen Schwarzmann', 10); t(60, 178, 'Birkenallee 14', 10); t(60, 192, '50939 Köln', 10);
+  t(360, 150, 'Kundennummer: 123456 B 7890', 9);
+  t(360, 164, 'Versichertennummer: A987654321', 9);
+  t(360, 178, 'Datum: 02.10.2024', 9);
+  t(60, 250, 'Leistungsübersicht 2024', 14, true);
+  t(60, 280, 'Sehr geehrter Herr Schwarzmann,', 10);
+  t(60, 296, 'anbei die Übersicht Ihrer Leistungen. Details finden Sie auf Seite 2.', 10);
+  t(60, 790, 'GKR Gesundheitskasse Rheinland · Domstraße 1 · 50667 Köln · www.gkr-beispiel.de · Seite 1 von 2', 6.5);
+  page();
+  // Kopfzeile Seite 2: Name und Versichertennummer klein oben
+  t(60, 40, 'GKR Leistungsübersicht 2024 für Jochen Schwarzmann · Versichertennummer A987654321', 7.5);
+  line(60, 44, 535);
+  t(60, 90, 'Datum', 9, true); t(140, 90, 'Leistung', 9, true); t(470, 90, 'Betrag', 9, true);
+  t(60, 104, '05.03.2024', 9); t(140, 104, 'Zahnersatz', 9); t(470, 104, '612,00 €', 9);
+  t(60, 140, 'Bitte geben Sie bei Rückfragen Ihre Kundennummer 123456 B 7890 an.', 10);
+  t(60, 170, 'Mit freundlichen Grüßen', 10);
+  t(60, 184, 'Ihre GKR Gesundheitskasse Rheinland', 10);
+  // Fußzeile Seite 2 mit der Kundennummer
+  t(60, 790, 'GKR Gesundheitskasse Rheinland · Kundennummer 123456 B 7890 · Jochen Schwarzmann · Seite 2 von 2', 6.5);
+};
+const expectMehrseitig = {
+  person: ['Jochen Schwarzmann', 'Birkenallee 14', '50939 Köln', '123456 B 7890', 'A987654321', 'Schwarzmann'],
+  sender: ['Postfach 10 20 30', 'Domstraße 1'],
+  blocks: [{ owner: 'person', contains: ['Jochen Schwarzmann', 'Birkenallee 14', '50939 Köln'] }],
+  exact: { '123456 B 7890': 'Kundennummer' },
+  // Jede Stelle dieser Werte muss als „eigene Daten“ gelten – auch in Kopf- und Fußzeile von Seite 2
+  everywherePerson: ['123456 B 7890', 'A987654321', 'Jochen Schwarzmann'],
+  notPerson: ['Leistungsübersicht', 'Zahnersatz'],
+};
+
 const SAMPLES = [
   ['kasse-a.pdf', kasse(KASSE_A), expectKasse(KASSE_A)],
   ['kasse-b.pdf', kasse(KASSE_B), expectKasse(KASSE_B)],
@@ -374,6 +415,7 @@ const SAMPLES = [
   ['privatbrief.pdf', privatbrief, expectPrivat],
   ['vertrag.pdf', vertrag, expectVertrag],
   ['zweiseitig.pdf', zweiseitig, expectZweiseitig],
+  ['mehrseitig.pdf', mehrseitig, expectMehrseitig],
 ];
 
 module.exports = { SAMPLES, makeDoc };

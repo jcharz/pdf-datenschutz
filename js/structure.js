@@ -136,13 +136,17 @@ function ownerOf(c, model) {
   const z = zone(model, L);
   const sender = (strong = false) => ({ owner: 'sender', strong });
   const person = (strong = false) => ({ owner: 'person', strong });
-  if (z === 'footer' && L.size <= 9) return sender(true);
   // Beschriftung links in derselben Zeile (Tabellen: „Telefon | 040 …“) zählt mit
   const rowLabel = model.lines.filter((x) => x !== L && x.x0 !== null && Math.abs(x.y - L.y) <= 0.35 * L.size
     && x.x1 <= L.x0 + 1 && L.x0 - x.x1 < 220).sort((a, b) => b.x1 - a.x1)[0];
   const before = (rowLabel ? `${rowLabel.text} ` : '') + model.text.slice(L.start, c.start);
-  if (SENDER_LABEL.test(before)) return sender(true);
-  if (PERSON_LABEL.test(before) || SALUTATION.test(before.trim())) return person(true);
+  // Die nächstgelegene Beschriftung entscheidet („GKR · Kundennummer 123“ → Kundennummer gehört zur Person),
+  // auch in Kopf- und Fußzeilen
+  const lastAt = (rx) => { let i = -1; for (const m of before.matchAll(new RegExp(rx.source, `${rx.flags.replace('g', '')}g`))) i = m.index; return i; };
+  const si = lastAt(SENDER_LABEL), pi = Math.max(lastAt(PERSON_LABEL), SALUTATION.test(before.trim()) ? 0 : -1);
+  if (pi >= 0 && pi >= si) return person(true);
+  if (si >= 0) return sender(true);
+  if (z === 'footer' && L.size <= 9) return sender(true);
   const blockLines = [...(L.block?.lines || [L]), ...(rowLabel?.block?.lines || [])];
   if (blockLines.some((x) => SALUTATION.test(x.text)) && !ORG.test(blockLines[0].text)) return person(true);
   if (z === 'header' && (senderEvidence(blockLines) || letterheadNear(model, L))) return sender();
@@ -258,13 +262,16 @@ export function analyzeDocument(models) {
   // Gleicher Wert an mehreren Stellen: ausdrücklicher Beleg gilt für alle Stellen (Person hat Vorrang)
   const byValue = new Map();
   for (const c of claimed) {
-    const k = valueKey(c.cat, c.text);
+    // gleicher Wert unabhängig von der Kategorie (z. B. einmal „Kundennummer“, einmal „Nummer“)
+    const k = c.cat === 'names' ? valueKey(c.cat, c.text) : `v|${c.text.replace(/[^\p{L}\p{N}]/gu, '').toUpperCase()}`;
     if (!byValue.has(k)) byValue.set(k, []);
     byValue.get(k).push(c);
   }
+  // Reihenfolge: ausdrücklich Person → ausdrücklich Absender → irgendwo Person (im Zweifel Person)
   for (const list of byValue.values()) {
     const strong = list.filter((c) => c.strongOwner);
-    const owner = strong.some((c) => c.owner === 'person') ? 'person' : strong.length ? 'sender' : null;
+    const owner = strong.some((c) => c.owner === 'person') ? 'person' : strong.length ? 'sender'
+      : list.some((c) => c.owner === 'person') ? 'person' : null;
     if (owner) for (const c of list) c.owner = owner;
   }
 
@@ -279,9 +286,15 @@ export function analyzeDocument(models) {
       const owner = b.inline ? (partsIn.some((c) => c.owner === 'person') ? 'person' : 'sender') : blockOwner(b.lines, model);
       const inside = [];
       const occurrences = b.ranges.map(([s, e]) => {
-        const parts = pageCands.filter((c) => c.start >= s && c.end <= e);
+        // In einem Absenderblock bleiben eigene Daten (z. B. die Kundennummer in der Fußzeile) eigene Funde
+        const all = pageCands.filter((c) => c.start >= s && c.end <= e);
+        const parts = all.filter((c) => !(owner === 'sender' && c.owner === 'person'));
         inside.push(...parts);
-        return { page, start: s, end: e, text: model.text.slice(s, e), parts: parts.map((c) => ({ cat: c.cat, label: c.label, start: c.start - s, end: c.end - s, text: c.text })) };
+        return {
+          page, start: s, end: e, text: model.text.slice(s, e),
+          parts: parts.map((c) => ({ cat: c.cat, label: c.label, start: c.start - s, end: c.end - s, text: c.text })),
+          protect: all.filter((c) => !parts.includes(c)).map((c) => [c.start - s, c.end - s]),
+        };
       });
       if (!inside.length) continue; // nur Blöcke, in denen wirklich etwas steckt
       inside.forEach((c) => absorbed.add(c));

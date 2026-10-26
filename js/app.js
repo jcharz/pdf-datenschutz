@@ -1,7 +1,7 @@
 // Ablauf der App: PDF öffnen → automatisch prüfen → pro Fund entscheiden → anwenden → vergleichen → speichern.
 
 import * as pdfjsLib from '../vendor/pdfjs/pdf.min.mjs';
-import { parseCommand, findMatches, valueKey, normalize, SHORT } from './detect.js';
+import { termPattern, parseCommand, findMatches, valueKey, normalize, SHORT } from './detect.js';
 import { buildPageModel, segmentsForRange, findImages } from './pdfmodel.js';
 import { analyzeDocument } from './structure.js';
 import { redactPdf, verifyResult } from './redact.js';
@@ -20,7 +20,7 @@ const PDF_OPTS = {
 
 const $ = (id) => document.getElementById(id);
 const ui = {
-  open: $('btnOpen'), open2: $('btnOpen2'), fileInput: $('fileInput'), fileName: $('fileName'),
+  open: $('btnOpen'), open2: $('btnOpen2'), close: $('btnClose'), sheetBar: $('sheetBar'), fileInput: $('fileInput'), fileName: $('fileName'),
   empty: $('empty'), viewer: $('viewer'), toolbar: $('toolbar'), spacer: $('spacer'),
   zoom: $('btnZoom'), mark: $('btnMark'), tabOriginal: $('tabOriginal'), tabResult: $('tabResult'), pageInfo: $('pageInfo'),
   sheet: $('sheet'), sheetHead: $('sheetHead'), summary: $('summary'), primary: $('btnPrimary'), scrim: $('scrim'),
@@ -146,7 +146,7 @@ async function openFile(file, handle = null) {
     pseudo = new Pseudonymizer(table);
     ui.fileName.textContent = state.file.name;
     ui.empty.hidden = true;
-    for (const x of [ui.viewer, ui.toolbar, ui.sheet, ui.spacer]) x.hidden = false;
+    for (const x of [ui.viewer, ui.toolbar, ui.sheet, ui.spacer, ui.close]) x.hidden = false;
     setView('original');
     await viewer.setDocument(doc);
 
@@ -452,19 +452,18 @@ function changed() {
 function renderSummary() {
   const c = counts();
   const n = state.findings.length;
-  ui.summary.replaceChildren();
-  if (state.result && !state.stale) {
-    const ok = state.result.report.ok;
-    ui.summary.append(el('span', { class: ok ? 'ok' : 'bad' }, ok ? '✓ Fertig und geprüft' : '✗ Bitte Prüfbericht ansehen'));
-  } else {
-    ui.summary.append(el('b', {}, n ? `${n} Fund${n === 1 ? '' : 'e'}` : 'Keine Funde'));
-  }
-  if (c.redact) ui.summary.append(el('span', { class: 'pill redact' }, `■ ${c.redact} schwärzen`));
-  if (c.replace) ui.summary.append(el('span', { class: 'pill replace' }, `⇄ ${c.replace} ersetzen`));
-  if (c.keep) ui.summary.append(el('span', { class: 'pill' }, `${c.keep} behalten`));
-
   const done = state.result && !state.stale;
-  ui.primary.textContent = done ? 'Speichern' : state.result ? 'Änderungen anwenden' : 'Anwenden';
+  ui.summary.replaceChildren();
+  if (done && !state.result.report.ok) ui.summary.append(el('span', { class: 'bad' }, '⚠︎ Rest gefunden – ansehen'));
+  else if (done) ui.summary.append(el('span', { class: 'ok' }, '✓ Geprüft'), ` · ${c.redact + c.replace} entfernt`);
+  else {
+    ui.summary.append(el('b', {}, n ? `${n} Fund${n === 1 ? '' : 'e'}` : 'Keine Funde'));
+    if (c.redact) ui.summary.append(' · ', el('span', { class: 'r' }, `■ ${c.redact}`));
+    if (c.replace) ui.summary.append(' · ', el('span', { class: 'x' }, `⇄ ${c.replace}`));
+    if (c.keep) ui.summary.append(` · ${c.keep} bleiben`);
+  }
+  const leftover = done && !state.result.report.ok;
+  ui.primary.textContent = leftover ? 'Rest entfernen' : done ? 'Speichern' : state.result ? 'Neu anwenden' : 'Anwenden';
   ui.primary.disabled = state.busy || (!done && !c.redact && !c.replace);
 }
 
@@ -484,7 +483,7 @@ function renderList() {
   const visible = state.findings.filter((f) => state.filter === 'alle' || ownerOfFinding(f) === state.filter);
   const person = visible.filter((f) => ownerOfFinding(f) === 'person');
   const sender = visible.filter((f) => ownerOfFinding(f) === 'sender');
-  ui.list.replaceChildren(
+  ui.list.replaceChildren(...[
     ...renderTemplateOffer(),
     ...state.notices.map((t) => el('li', { class: 'notice' }, '⚠︎ ', t)),
     person.length && sender.length ? el('li', { class: 'section' }, `Deine Daten · ${person.length}`) : null,
@@ -492,7 +491,7 @@ function renderList() {
     sender.length ? el('li', { class: 'section' }, `Absender & Organisationen · ${sender.length}`,
       el('span', { class: 'hint' }, settings.preselectSender ? '' : 'standardmäßig behalten')) : null,
     ...sender.map(renderFinding),
-  );
+  ].filter(Boolean));
   if (!state.findings.length && state.doc) {
     ui.list.append(el('li', { class: 'nothing' }, 'Keine kritischen Daten erkannt. Ergänze per Hinweis oder markiere Bereiche mit ▭.'));
   }
@@ -622,7 +621,48 @@ function openSheet(open) {
   ui.sheet.classList.toggle('open', open);
   ui.scrim.hidden = !open;
   ui.sheetHead.setAttribute('aria-expanded', String(open));
-  if (open) ui.body.scrollTop = ui.body.scrollTop; // iOS: Scrollposition behalten
+}
+
+// Höhe der eingeklappten Leiste messen, damit Seite und Werkzeugleiste nie darunter verschwinden
+new ResizeObserver(() => {
+  if (!ui.sheet.classList.contains('open') && !ui.sheet.hidden) {
+    document.documentElement.style.setProperty('--sheet-h', `${ui.sheet.offsetHeight}px`);
+  }
+}).observe(ui.sheet);
+
+// Leiste nach oben/unten wischen = Liste auf-/zuklappen
+let swipedAt = 0;
+(() => {
+  let y0 = null;
+  ui.sheetHead.addEventListener('pointerdown', (e) => { y0 = e.clientY; ui.sheetHead.setPointerCapture(e.pointerId); });
+  ui.sheetHead.addEventListener('pointerup', (e) => {
+    if (y0 === null) return;
+    const dy = e.clientY - y0;
+    y0 = null;
+    if (Math.abs(dy) < 30) return; // normales Tippen → click-Ereignis
+    swipedAt = performance.now();
+    openSheet(dy < 0);
+  });
+  ui.sheetHead.addEventListener('pointercancel', () => { y0 = null; });
+})();
+
+// ---------------------------------------------------------------------------
+// Dokument schließen
+// ---------------------------------------------------------------------------
+
+async function closeDocument() {
+  if (!state.doc) return;
+  if (state.result && !state.saved && !confirm('Das bearbeitete PDF wurde noch nicht gespeichert. Trotzdem schließen?')) return;
+  openSheet(false);
+  setMarkMode(false);
+  await clearResult();
+  viewer.clear();
+  await state.doc.destroy();
+  Object.assign(state, { file: null, doc: null, models: [], findings: [], notices: [], hints: [], templateOffer: null, templateId: null, focusId: null, saved: false });
+  ui.fileName.textContent = 'PDF Datenschutz';
+  for (const x of [ui.viewer, ui.toolbar, ui.sheet, ui.spacer, ui.close]) x.hidden = true;
+  ui.empty.hidden = false;
+  toast('Dokument geschlossen. Es ist nichts davon auf dem Gerät gespeichert.');
 }
 
 // ---------------------------------------------------------------------------
@@ -630,11 +670,86 @@ function openSheet(open) {
 // ---------------------------------------------------------------------------
 
 async function primaryAction() {
+  if (state.result && !state.stale && !state.result.report.ok) {
+    const r = state.result.report;
+    return fixLeftovers([...new Set([...r.leftInText, ...r.leftInRaw])]);
+  }
   if (state.result && !state.stale) return openSave();
   await applyAll();
 }
 
-async function applyAll() {
+// ---------------------------------------------------------------------------
+// Sicherheitsrunde: jeder Wert, der entfernt wird, wird überall im Dokument entfernt
+// ---------------------------------------------------------------------------
+
+const SALUTATION_ONLY = /^(Herrn?|Frau|Familie|Firma|Eheleute|An|z\.\s?Hd\.?)$/i;
+
+/** Genau dieser Wert (Groß/klein, Leerzeichen und Bindestriche egal) – ohne „ähnliche Schreibweisen“. */
+function findExact(term, pages = texts()) {
+  const rx = new RegExp(`(?<![\\p{L}\\p{N}])(?:${termPattern(term)})(?![\\p{L}\\p{N}])`, 'giu');
+  return pages.flatMap((t, page) => [...t.matchAll(rx)].map((m) => ({ page, start: m.index, end: m.index + m[0].length, text: m[0] })));
+}
+
+/** Wird die Stelle [s, e) beim Anwenden schon von einem aktiven Fund bearbeitet? */
+function coveredByActive(page, s, e) {
+  return state.findings.some((g) => g.action !== 'keep' && g.occurrences.some((o) => {
+    if (o.page !== page || o.start === undefined || !(o.start < e && s < o.end)) return false;
+    if (g.cat !== 'block' || g.action === 'redact') return true;
+    // ersetzter Block: nur die ersetzten Stücke zählen
+    return (g.pieces?.get(o.text) || []).some((ch) => o.start + ch.start <= s && e <= o.start + ch.end);
+  }));
+}
+
+/**
+ * Sucht die Werte aller aktiven Funde im ganzen Dokument. Stellen, die noch nicht bearbeitet würden
+ * (z. B. dieselbe Kundennummer in einer behaltenen Fußzeile auf Seite 2), werden dem Fund hinzugefügt.
+ * Rückgabe: Anzahl ergänzter Stellen.
+ */
+async function sweepOccurrences() {
+  let added = 0;
+  const pages = texts();
+  const extra = [];
+  for (const f of state.findings) {
+    if (f.action === 'keep' || ['manual', 'image'].includes(f.cat)) continue;
+    const values = f.cat === 'block'
+      ? f.occurrences.flatMap((o) => (o.parts || []).map((p) => ({ text: p.text, cat: p.cat, label: p.label })))
+      : [...new Set(f.occurrences.map((o) => o.text.replace(/\s+/g, ' ').trim()))].map((text) => ({ text }));
+    for (const v of values) {
+      if (v.text.replace(/[^\p{L}\p{N}]/gu, '').length < 4 || SALUTATION_ONLY.test(v.text.trim())) continue;
+      for (const h of findExact(v.text, pages)) {
+        if (coveredByActive(h.page, h.start, h.end)) continue;
+        if (f.cat === 'block') extra.push({ ...h, cat: v.cat, label: v.label, action: f.action });
+        else {
+          const occ = { page: h.page, start: h.start, end: h.end, text: h.text };
+          occ.segments = segmentsForRange(state.models[h.page], h.start, h.end);
+          occ.quads = occ.segments.map((sg) => sg.quad);
+          f.occurrences.push(occ);
+        }
+        added++;
+      }
+    }
+  }
+  // Teile aus Blöcken, die außerhalb des Blocks noch einmal vorkommen → eigener Fund mit gleicher Aktion
+  const groups = new Map();
+  for (const h of extra) {
+    const key = valueKey(h.cat, h.text);
+    if (!groups.has(key)) groups.set(key, { cat: h.cat, label: h.label || SHORT[h.cat], risk: 'hoch', owner: 'person', action: h.action, occurrences: [] });
+    if (!groups.get(key).occurrences.some((o) => o.page === h.page && o.start === h.start)) groups.get(key).occurrences.push({ page: h.page, start: h.start, end: h.end, text: h.text });
+  }
+  for (const g of groups.values()) {
+    g.value = g.occurrences[0].text.replace(/\s+/g, ' ').trim();
+    const nf = makeFinding(g);
+    await pseudo.prepare(nf);
+    nf.action = g.action === 'replace' && !nf.fake ? 'redact' : g.action;
+    nf.note = 'Steht auch an anderer Stelle – automatisch mit entfernt.';
+    state.findings.push(nf);
+  }
+  return added;
+}
+
+async function applyAll({ rasterAll = settings.rasterAll } = {}) {
+  const swept = state.testNoSweep ? 0 : await sweepOccurrences();
+  if (swept) changed();
   const active = state.findings.filter((f) => f.action !== 'keep');
   if (!active.length) return toast('Es ist nichts zum Schwärzen oder Ersetzen ausgewählt.');
   state.busy = true;
@@ -650,8 +765,18 @@ async function applyAll() {
         const r = get(o.page);
         const area = f.cat === 'manual' || f.cat === 'image';
         if (area) { r.blockQuads.push(...o.quads); continue; }
+        if (f.cat === 'block' && f.action === 'replace') {
+          // Block: Stück für Stück an der Originalstelle ersetzen (Rest der Zeile bleibt unverändert)
+          for (const ch of f.pieces?.get(o.text) || []) {
+            const segments = segmentsForRange(state.models[o.page], o.start + ch.start, o.start + ch.end);
+            for (let i = o.start + ch.start; i < o.start + ch.end; i++) r.excluded.add(i);
+            if (segments.some((sg) => sg.geom)) r.replacements.push({ segments, text: ch.fake });
+            else r.quads.push(...segments.map((sg) => sg.quad));
+          }
+          continue;
+        }
         const fake = f.action === 'replace' ? pseudo.fakeFor(f, o.text) : null;
-        if (fake !== null && fake === o.text) continue; // z. B. „Herrn“ im Adressblock bleibt stehen
+        if (fake !== null && fake === o.text) continue;
         for (let i = o.start; i < o.end; i++) r.excluded.add(i);
         const replaceable = f.action === 'replace' && o.segments.some((s) => s.geom);
         if (replaceable) r.replacements.push(...splitAcrossLines(o, fake));
@@ -660,15 +785,19 @@ async function applyAll() {
     }
     const { bytes, stats } = await redactPdf({
       bytes: state.file.bytes, pdfDoc: state.doc, redactions, models: state.models,
-      rasterAll: settings.rasterAll, dpi: settings.dpi,
+      rasterAll, dpi: settings.dpi,
       onProgress: (i, n) => busy(`Bearbeite Seite ${i} von ${n} …`),
     });
 
     busy('Prüfe das Ergebnis …');
     // Geprüft werden die eigentlichen Werte (bei Blöcken die erkannten Teile, z. B. Straße und Name)
-    const removedTexts = active.flatMap((f) => f.occurrences.flatMap((o) => (o.parts?.length ? o.parts.map((p) => p.text) : [o.text]))).filter(Boolean);
-    const keptTexts = state.findings.filter((f) => f.action === 'keep').flatMap((f) => f.occurrences.map((o) => o.text))
-      .concat(active.filter((f) => f.action === 'replace').flatMap((f) => (f.fake || '').split('\n')));
+    const removedTexts = active.flatMap((f) => f.occurrences.flatMap((o) => {
+      if (f.cat === 'block') return o.parts?.length ? o.parts.map((p) => p.text) : SALUTATION_ONLY.test(o.text.trim()) ? [] : [o.text];
+      return [o.text];
+    })).filter(Boolean);
+    // Nach der Sicherheitsrunde ist jeder entfernte Wert überall entfernt – „behalten“ entschuldigt keinen Rest mehr.
+    // Ausgenommen sind nur die Ersatzwerte selbst.
+    const keptTexts = active.filter((f) => f.action === 'replace').flatMap((f) => (f.fake || '').split('\n'));
     const replacements = active.filter((f) => f.action === 'replace' && f.fake).map((f) => [f.value, f.fake]);
     const report = await verifyResult({ pdfjsLib, bytes, rules: [], removedTexts, keptTexts });
 
@@ -677,13 +806,15 @@ async function applyAll() {
 
     await clearResult();
     const doc = await pdfjsLib.getDocument({ ...PDF_OPTS, data: bytes.slice() }).promise;
-    state.result = { bytes, doc, report, stats, replacements };
+    state.result = { bytes, doc, report, stats, replacements, swept };
+    state.saved = false;
     state.stale = false;
     ui.tabResult.disabled = false;
     ui.tabResult.classList.remove('stale');
     renderReport();
     await setView('result');
-    openSheet(false);
+    openSheet(!report.ok); // Rest gefunden → Bericht sofort zeigen
+    if (!report.ok) ui.body.scrollTop = 0;
     toast(report.ok ? 'Fertig. Mit „Vorher/Nachher“ vergleichen, dann speichern.' : 'Achtung: Bitte den Prüfbericht ansehen.', 4000);
   } catch (e) {
     reportError(e, 'Bearbeitung fehlgeschlagen.');
@@ -725,30 +856,71 @@ function splitAcrossLines(o, fake) {
   return rows.map((r, k) => ({ segments: r.segments, text: parts[k] }));
 }
 
+/** Wo steht ein Text im Original? (Seitenzahlen für den Prüfbericht) */
+function pagesOf(text) {
+  return [...new Set(findExact(text).map((h) => h.page + 1))];
+}
+
 function renderReport() {
   const { report, stats } = state.result;
   ui.verify.hidden = false;
   ui.verify.replaceChildren();
-  const line = (cls, text) => ui.verify.append(el('div', { class: cls }, text));
-  const parts = [stats.boxes ? `${stats.boxes} Stelle(n) geschwärzt` : '', stats.replaced ? `${stats.replaced} ersetzt` : ''].filter(Boolean).join(', ');
-  if (report.ok) line('ok', `✓ ${parts}. Die Originale sind im neuen PDF nicht mehr auffindbar – weder im Text noch in Datenströmen oder Metadaten.`);
-  else line('bad', '✗ Achtung: Im Ergebnis wurden noch Spuren gefunden!');
-  if (report.leftInText.length) line('bad', `Noch im Text: ${report.leftInText.join(', ')}`);
-  if (report.leftInRaw.length) line('bad', `Noch in PDF-Datenströmen: ${report.leftInRaw.join(', ')}`);
-  line('small', `${stats.rasterized} Seite(n) neu aufgebaut, ${stats.copied} übernommen. Metadaten, Kommentare, Formulare, Lesezeichen und Anhänge wurden entfernt.`);
-  // Was wurde womit ersetzt?
+  const c = counts();
+  const left = [...new Set([...report.leftInText, ...report.leftInRaw])];
+  if (report.ok) {
+    ui.verify.append(el('div', { class: 'report-head ok' }, '✓ Geprüft: Keine der entfernten Angaben steht mehr im neuen PDF.'));
+  } else {
+    ui.verify.append(el('div', { class: 'report-head bad' },
+      `✗ ${left.length === 1 ? 'Eine Angabe steht' : `${left.length} Angaben stehen`} noch im PDF:`,
+      el('ul', { class: 'leftovers' }, left.map((t) => {
+        const pg = pagesOf(t);
+        return el('li', {}, el('b', {}, t), pg.length ? ` (Seite ${pg.join(', ')})` : '');
+      })),
+      el('div', { class: 'actions-row' },
+        el('button', { type: 'button', class: 'btn primary small', onclick: () => fixLeftovers(left) }, 'Diese Stellen auch entfernen'),
+        report.leftInRaw.length ? el('button', { type: 'button', class: 'btn small', onclick: () => applyAll({ rasterAll: true }) }, 'Alle Seiten als Bild neu aufbauen') : null,
+        el('button', { type: 'button', class: 'btn small', onclick: openSave }, 'Trotzdem speichern'),
+      ),
+    ));
+  }
+  ui.verify.append(el('div', { class: 'report-line' },
+    [c.redact ? `${c.redact} geschwärzt` : '', c.replace ? `${c.replace} ersetzt` : '', c.keep ? `${c.keep} behalten` : ''].filter(Boolean).join(' · '),
+    state.result.swept ? ` · ${state.result.swept} weitere Stelle(n) derselben Werte automatisch mit entfernt` : ''));
   const replaced = state.result.replacements || [];
   if (replaced.length) {
-    ui.verify.append(el('details', { class: 'report-map', open: replaced.length <= 6 },
-      el('summary', {}, `Ersetzt (${replaced.length})`),
+    ui.verify.append(el('details', { class: 'report-map' },
+      el('summary', {}, `Was wurde ersetzt? (${replaced.length})`),
       el('table', {}, el('tbody', {}, replaced.map(([from, to]) => el('tr', {}, el('td', {}, from), el('td', { class: 'to' }, `→ ${to}`))))),
     ));
   }
+  ui.verify.append(el('details', { class: 'report-map' },
+    el('summary', {}, 'Technische Details'),
+    el('p', { class: 'small' }, `${stats.rasterized} Seite(n) neu als Bild aufgebaut, ${stats.copied} unverändert übernommen. `
+      + 'Metadaten, Kommentare, Formulare, Lesezeichen und Anhänge wurden entfernt. Geprüft wurden Text, Metadaten und alle Datenströme.'),
+  ));
   const existing = state.templateId && templates.get(state.templateId);
   ui.verify.append(el('div', { class: 'actions-row' },
     el('button', { type: 'button', class: 'btn small', onclick: saveTemplate },
       existing ? `Schablone „${existing.name}“ aktualisieren` : '📋 Als Schablone merken'),
   ));
+}
+
+/** Reste aus dem Prüfbericht: Fundstellen im Original suchen, als eigene Daten schwärzen und neu anwenden. */
+async function fixLeftovers(list) {
+  for (const t of list) {
+    const hits = findExact(t).filter((h) => !coveredByActive(h.page, h.start, h.end));
+    for (const f of state.findings) {
+      // gleicher Wert, aber als „behalten“ markiert → mit entfernen
+      if (f.action === 'keep' && f.occurrences.some((o) => hits.some((h) => o.page === h.page && o.start < h.end && h.start < o.end))) {
+        f.owner = 'person';
+        f.action = f.cat === 'block' ? 'redact' : f.fake ? 'replace' : 'redact';
+      }
+    }
+    const rest = hits.filter((h) => !coveredByActive(h.page, h.start, h.end));
+    if (rest.length) await applyHits(rest, { cat: 'hint' });
+  }
+  changed();
+  await applyAll();
 }
 
 async function clearResult() {
@@ -805,17 +977,19 @@ async function save() {
       const w = await state.file.handle.createWritable();
       await w.write(blob);
       await w.close();
+      state.saved = true;
       return toast(`Gespeichert: ${name}`);
     }
     const file = new File([blob], name, { type: 'application/pdf' });
     if (matchMedia('(pointer: coarse)').matches && navigator.canShare?.({ files: [file] })) {
-      try { await navigator.share({ files: [file] }); return; } catch (e) { if (e.name === 'AbortError') return; }
+      try { await navigator.share({ files: [file] }); state.saved = true; return; } catch (e) { if (e.name === 'AbortError') return; }
     }
     if (window.showSaveFilePicker) {
       const h = await window.showSaveFilePicker({ suggestedName: name, types: [{ description: 'PDF', accept: { 'application/pdf': ['.pdf'] } }] });
       const w = await h.createWritable();
       await w.write(blob);
       await w.close();
+      state.saved = true;
       return toast(`Gespeichert: ${h.name}`);
     }
     const url = URL.createObjectURL(blob);
@@ -824,6 +998,7 @@ async function save() {
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    state.saved = true;
     toast(`Gespeichert: ${name}`);
   } catch (e) {
     if (e.name !== 'AbortError') reportError(e, 'Speichern fehlgeschlagen.');
@@ -916,6 +1091,7 @@ ui.btnClearTable.addEventListener('click', () => {
 // ---------------------------------------------------------------------------
 
 ui.open.addEventListener('click', pickFile);
+ui.close.addEventListener('click', closeDocument);
 ui.open2.addEventListener('click', pickFile);
 ui.fileInput.addEventListener('change', () => {
   const f = ui.fileInput.files[0];
@@ -927,7 +1103,10 @@ ui.zoom.addEventListener('click', () => viewer.toggleZoom(0));
 ui.mark.addEventListener('click', () => setMarkMode(!viewer.markMode));
 ui.tabOriginal.addEventListener('click', () => setView('original'));
 ui.tabResult.addEventListener('click', () => setView('result'));
-ui.sheetHead.addEventListener('click', () => openSheet(!ui.sheet.classList.contains('open')));
+ui.sheetHead.addEventListener('click', () => {
+  if (performance.now() - swipedAt < 400) return; // gerade gewischt
+  openSheet(!ui.sheet.classList.contains('open'));
+});
 ui.scrim.addEventListener('click', () => openSheet(false));
 ui.primary.addEventListener('click', primaryAction);
 ui.hintForm.addEventListener('submit', (e) => { e.preventDefault(); ui.hintInput.blur(); applyHint(ui.hintInput.value); });
@@ -967,4 +1146,4 @@ if ('serviceWorker' in navigator && location.protocol === 'https:') {
 }
 
 // Für automatisierte Tests
-window.__pdfPrivacy = { state, viewer, table, templates, openFile, applyAll, applyHint, setAction, applyTemplate, saveTemplate };
+window.__pdfPrivacy = { state, viewer, table, templates, openFile, applyAll, applyHint, setAction, applyTemplate, saveTemplate, fixLeftovers };

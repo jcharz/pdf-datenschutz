@@ -1,6 +1,6 @@
 // Service Worker: hält die App-Dateien auf dem Gerät, damit sie offline funktioniert.
 // Dokumente werden hier nie gespeichert – sie existieren nur im Arbeitsspeicher der Seite.
-const VERSION = 'v3';
+const VERSION = 'v4';
 const CACHE = `pdf-redact-${VERSION}`;
 const APP_FILES = [
   './', 'index.html', 'css/app.css', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-180.png', 'icons/icon-512.png',

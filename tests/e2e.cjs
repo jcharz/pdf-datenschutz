@@ -203,6 +203,29 @@ function rawText(buf) {
   await page.waitForTimeout(300);
   await page.screenshot({ path: path.join(OUT, 'e2e-5-bekannt.png') });
 
+  // Bedienung auf dem iPhone: Leiste verdeckt nichts, Wischen klappt die Liste auf/zu, ✕ schließt das Dokument
+  await page.evaluate(() => { const s = document.getElementById('sheet'); s.classList.remove('open'); document.getElementById('scrim').hidden = true; });
+  await page.waitForTimeout(300);
+  const box = async (sel) => page.locator(sel).boundingBox();
+  const [tb, sh, vw] = [await box('#toolbar'), await box('#sheet'), await box('#viewer')];
+  check(tb.y + tb.height <= sh.y + 1 && vw.y + vw.height <= tb.y + 1, `Werkzeugleiste und Seite nicht von der Leiste verdeckt (Leiste ${Math.round(sh.height)} px hoch)`);
+  const bar = await box('#sheetHead');
+  await page.mouse.move(bar.x + bar.width / 2, bar.y + 20); await page.mouse.down();
+  await page.mouse.move(bar.x + bar.width / 2, bar.y - 80, { steps: 5 }); await page.mouse.up();
+  await page.waitForTimeout(300);
+  check(await page.evaluate(() => document.getElementById('sheet').classList.contains('open')), 'Nach oben wischen öffnet die Liste');
+  await page.screenshot({ path: path.join(OUT, 'e2e-7-liste-offen.png') });
+  const bar2 = await box('#sheetHead');
+  await page.mouse.move(bar2.x + bar2.width / 2, bar2.y + 10); await page.mouse.down();
+  await page.mouse.move(bar2.x + bar2.width / 2, bar2.y + 120, { steps: 5 }); await page.mouse.up();
+  await page.waitForTimeout(300);
+  check(await page.evaluate(() => !document.getElementById('sheet').classList.contains('open')), 'Nach unten wischen schließt die Liste');
+  await page.screenshot({ path: path.join(OUT, 'e2e-8-liste-zu.png') });
+  page.once('dialog', (d) => d.accept());
+  await page.click('#btnClose');
+  await page.waitForTimeout(300);
+  check(await page.evaluate(() => !document.getElementById('empty').hidden && !window.__pdfPrivacy.state.doc), '✕ schließt das Dokument (Startbildschirm)');
+
   check(!external.length, `Keine Verbindungen nach außen ${external.join(' ')}`);
   check(!errors.length, `Keine JS-Fehler ${errors.join('; ')}`);
 

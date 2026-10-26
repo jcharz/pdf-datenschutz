@@ -180,16 +180,28 @@ function baseToken(tok, known) {
   return { key: n, suffix: '' };
 }
 
-function newNameFor(tok) {
+function newNameFor(tok, asFirst = false) {
   let n;
-  do n = pickName(tok); while (normalize(n) === normalize(tok));
+  do n = pickName(tok, asFirst); while (normalize(n) === normalize(tok));
   return n;
 }
 
-function pickName(tok) {
+/** Vorname bleibt Vorname (gleiches Geschlecht, falls bekannt), Nachname bleibt Nachname. */
+function pickName(tok, asFirst) {
   const cap = (s) => (tok === tok.toUpperCase() && tok.length > 1 ? s.toUpperCase() : tok[0] === tok[0].toLowerCase() ? s.toLowerCase() : s);
   if (FIRST_NAMES.has(tok)) return cap(pickLike(FEMALE.has(tok) ? FIRST_NAMES_F : FIRST_NAMES_M, tok));
+  if (asFirst) return cap(pickLike([...FIRST_NAMES_F, ...FIRST_NAMES_M], tok));
   return cap(pickLike(LAST_NAMES, tok));
+}
+
+/** Bestandteile, die vor einem weiteren Namensbestandteil stehen („Jochen“ in „Jochen Schwarzmann“) → Vornamen. */
+function firstNameTokens(texts) {
+  const out = new Set();
+  for (const t of texts) {
+    const toks = nameTokens(t).filter((x) => !/-$/.test(x));
+    toks.slice(0, -1).forEach((x) => out.add(x));
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -300,7 +312,7 @@ export class Pseudonymizer {
 
   /** Ersatzwert vorbereiten: aus der Tabelle (bekannt) oder neu erzeugt. Setzt f.fake und f.known. */
   /** Namensbestandteile bereitstellen (aus der Tabelle oder neu). Rückgabe: alle bekannt? */
-  async ensureNameTokens(toks) {
+  async ensureNameTokens(toks, firsts = new Set()) {
     let allKnown = true;
     for (const t of toks) {
       const { key } = baseToken(t, (k) => this.tokens.has(k));
@@ -312,7 +324,7 @@ export class Pseudonymizer {
     }
     for (const t of toks) {
       const { key } = baseToken(t, (k) => this.tokens.has(k));
-      if (!this.tokens.has(key)) this.tokens.set(key, newNameFor(t));
+      if (!this.tokens.has(key)) this.tokens.set(key, newNameFor(t, firsts.has(t)));
     }
     return allKnown && toks.length > 0;
   }
@@ -323,7 +335,7 @@ export class Pseudonymizer {
     const kind = this.kindOf(f);
     if (kind === 'name') {
       const toks = [...new Set([f.value, ...f.variants].flatMap(nameTokens))];
-      f.known = await this.ensureNameTokens(toks);
+      f.known = await this.ensureNameTokens(toks, firstNameTokens([f.value, ...f.variants]));
       f.fake = this.nameReplace(f.value);
       return;
     }
@@ -339,14 +351,14 @@ export class Pseudonymizer {
   // Blöcke (Adresse, Briefkopf, Fußzeile): Zeile für Zeile, Teil für Teil
   // -------------------------------------------------------------------------
 
-  /** Organisationsnamen: Schlüsselwörter (GmbH, Krankenkasse …) bleiben, Eigennamen werden ersetzt. */
-  async orgReplace(text, collect) {
-    const out = [];
-    for (const tok of text.split(/(\s+)/)) {
-      const word = tok.replace(/[.,;:]+$/, '');
+  /** Organisationsnamen: Schlüsselwörter (GmbH, Krankenkasse …) bleiben, Eigennamen werden ersetzt. Rückgabe: Änderungen. */
+  async orgChanges(text, collect) {
+    const changes = [];
+    for (const m of text.matchAll(/\S+/g)) {
+      const word = m[0].replace(/[.,;:]+$/, '');
       const isAcronym = /^[A-ZÄÖÜ]{2,5}$/.test(word);
       const isProper = /^[A-ZÄÖÜ][a-zäöüß]{2,}(?:-[A-ZÄÖÜ][a-zäöüß]+)?$/.test(word);
-      if (!word || ORG.test(word) || !(isAcronym || isProper) || FREE_KEEP.test(word)) { out.push(tok); continue; }
+      if (!word || ORG.test(word) || !(isAcronym || isProper) || FREE_KEEP.test(word)) continue;
       const key = normalize(word);
       if (!this.orgTokens.has(key)) {
         const hit = await this.table.lookup('org', key);
@@ -354,53 +366,85 @@ export class Pseudonymizer {
         else this.orgTokens.set(key, isAcronym ? Array.from({ length: word.length }, () => pick(UPPER)).join('') : pickLike(ORG_WORDS, word));
       }
       collect.org.add(key);
-      out.push(tok.replace(word, this.orgTokens.get(key)));
+      changes.push({ start: m.index, end: m.index + word.length, fake: this.orgTokens.get(key) });
     }
-    return out.join('');
+    return changes;
   }
 
-  /** Text eines Blocks, der keinem erkannten Teil gehört: Namen ersetzen, Organisationsnamen ersetzen, Rest behalten. */
-  async freeReplace(text, owner, collect) {
-    if (!/\p{L}/u.test(text)) return text.replace(/\d+/g, (d) => (d.length >= 3 ? shapeFake(d) : d));
+  /** Namensbestandteile im Text durch ihre Ersatznamen tauschen. Rückgabe: Änderungen. */
+  nameChanges(text) {
+    const changes = [];
+    for (const m of text.matchAll(/[\p{L}][\p{L}']*/gu)) {
+      const tok = m[0];
+      if (TITLE.test(tok) || tok.length < 2) continue;
+      const { key, suffix } = baseToken(tok, (k) => this.tokens.has(k));
+      const fake = this.tokens.get(key);
+      if (fake && fake + suffix !== tok) changes.push({ start: m.index, end: m.index + tok.length, fake: fake + suffix });
+    }
+    return changes;
+  }
+
+  /** Text eines Blocks, der keinem erkannten Teil gehört: Namen und Organisationsnamen ersetzen, Rest behalten. */
+  async freeChanges(text, owner, collect) {
+    if (!/\p{L}/u.test(text)) {
+      return [...text.matchAll(/\d{3,}/g)].map((m) => ({ start: m.index, end: m.index + m[0].length, fake: shapeFake(m[0]) }));
+    }
     if (ORG.test(text)) {
       // Nur Abschnitte mit Organisationsnamen anfassen; Beschriftungen („Bankverbindung:“) bleiben
-      const pieces = text.split(/(\s[·|•]\s|,\s|[A-Za-zÄÖÜäöüß.\-]+:\s?)/);
-      let out = '';
-      for (const piece of pieces) out += piece && ORG.test(piece) && !/:\s?$/.test(piece) ? await this.orgReplace(piece, collect) : piece;
+      const out = [];
+      let pos = 0;
+      for (const piece of text.split(/(\s[·|•]\s|,\s|[A-Za-zÄÖÜäöüß.\-]+:\s?)/)) {
+        if (piece && ORG.test(piece) && !/:\s?$/.test(piece)) {
+          for (const c of await this.orgChanges(piece, collect)) out.push({ ...c, start: c.start + pos, end: c.end + pos });
+        }
+        pos += piece.length;
+      }
       return out;
     }
     const words = text.split(/[\s,]+/).filter(Boolean);
     const nameish = words.every((w) => /^\p{Lu}[\p{L}'-]*\.?$/u.test(w) || /^(und|&|u\.|c\/o|von|van|de|zu)$/i.test(w));
-    if (owner !== 'person' || !nameish) return text;
+    if (owner !== 'person' || !nameish) return [];
     const toks = words.filter((w) => !FREE_KEEP.test(w.replace(/\.$/, '')) && /^\p{Lu}\p{Ll}+/u.test(w) && !TITLE.test(w));
-    if (!toks.length) return text;
-    if (!(await this.ensureNameTokens(toks))) collect.allKnown = false;
+    if (!toks.length) return [];
+    if (!(await this.ensureNameTokens(toks, firstNameTokens([toks.join(' ')])))) collect.allKnown = false;
     toks.forEach((t) => collect.names.add(t));
-    return this.nameReplace(text);
+    return this.nameChanges(text);
   }
 
+  /**
+   * Block (Adressblock, Briefkopf, Fußzeile): jede Zeile wird Stück für Stück ersetzt – erkannte Teile und
+   * Eigennamen an ihrer Originalstelle. f.pieces: Zeile → [{start, end, fake}], f.lineFakes: Zeile → Ergebnis.
+   */
   async prepareBlock(f, { fresh = false } = {}) {
     const collect = { names: new Set(), org: new Set(), subs: [], allKnown: true };
     f.lineFakes = new Map();
-    const seen = new Set();
+    f.pieces = new Map();
     for (const occ of f.occurrences) {
-      if (seen.has(occ.text)) continue;
-      seen.add(occ.text);
+      if (f.pieces.has(occ.text)) continue;
       const parts = [...(occ.parts || [])].sort((a, b) => a.start - b.start);
-      let out = '', pos = 0;
+      const changes = [];
+      let pos = 0;
+      const free = async (from, to) => {
+        for (const c of await this.freeChanges(occ.text.slice(from, to), f.owner, collect)) changes.push({ ...c, start: c.start + from, end: c.end + from });
+      };
       for (const p of parts) {
         if (p.start < pos) continue;
-        out += await this.freeReplace(occ.text.slice(pos, p.start), f.owner, collect);
+        await free(pos, p.start);
         const sub = { cat: p.cat, label: p.label || '', value: p.text, variants: [] };
         await this.prepare(sub);
         if (fresh) this.regenerate(sub);
         if (!sub.known) collect.allKnown = false;
         collect.subs.push(sub);
-        out += sub.fake ?? p.text;
+        if (sub.fake && sub.fake !== p.text) changes.push({ start: p.start, end: p.end, fake: sub.fake });
         pos = p.end;
       }
-      out += await this.freeReplace(occ.text.slice(pos), f.owner, collect);
-      f.lineFakes.set(occ.text, out);
+      await free(pos, occ.text.length);
+      // Eigene Daten in einem Absenderblock bearbeitet ihr eigener Fund – hier nicht anfassen
+      const kept = changes.filter((c) => !(occ.protect || []).some(([s, e]) => c.start < e && s < c.end)).sort((a, b) => a.start - b.start);
+      f.pieces.set(occ.text, kept);
+      let out = '', at = 0;
+      for (const c of kept) { out += occ.text.slice(at, c.start) + c.fake; at = c.end; }
+      f.lineFakes.set(occ.text, out + occ.text.slice(at));
     }
     if ([...collect.org].some((k) => !this.orgKnown.has(k))) collect.allKnown = false;
     f.subs = collect.subs;
@@ -413,14 +457,16 @@ export class Pseudonymizer {
 
   regenerate(f) {
     if (f.cat === 'block') {
-      for (const n of f.freeNames || []) { const { key } = baseToken(n, () => false); this.tokens.set(key, newNameFor(n)); this.tokenKnown.delete(key); }
+      const firsts = firstNameTokens([(f.freeNames || []).join(' ')]);
+      for (const n of f.freeNames || []) { const { key } = baseToken(n, () => false); this.tokens.set(key, newNameFor(n, firsts.has(n))); this.tokenKnown.delete(key); }
       for (const k of f.orgKeys || []) { this.orgTokens.delete(k); this.orgKnown.delete(k); }
       return this.prepareBlock(f, { fresh: true });
     }
     if (this.kindOf(f) === 'name') {
+      const firsts = firstNameTokens([f.value, ...f.variants]);
       for (const t of [f.value, ...f.variants].flatMap(nameTokens)) {
         const { key } = baseToken(t, (k) => this.tokens.has(k));
-        this.tokens.set(key, newNameFor(t));
+        this.tokens.set(key, newNameFor(t, firsts.has(t)));
         this.tokenKnown.delete(key);
       }
       f.fake = this.nameReplace(f.value);
@@ -432,12 +478,9 @@ export class Pseudonymizer {
   }
 
   nameReplace(text) {
-    return text.replace(/[\p{L}][\p{L}']*/gu, (tok) => {
-      if (TITLE.test(tok) || tok.length < 2) return tok;
-      const { key, suffix } = baseToken(tok, (k) => this.tokens.has(k));
-      const fake = this.tokens.get(key);
-      return fake ? fake + suffix : tok;
-    });
+    let out = '', at = 0;
+    for (const c of this.nameChanges(text)) { out += text.slice(at, c.start) + c.fake; at = c.end; }
+    return out + text.slice(at);
   }
 
   generate(f) {

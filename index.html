@@ -19,7 +19,8 @@
 </head>
 <body>
   <header class="topbar">
-    <button id="btnOpen" class="btn ghost" type="button"><span class="ic">＋</span> PDF</button>
+    <button id="btnClose" class="btn ghost icon" type="button" aria-label="Dokument schließen" title="Dokument schließen" hidden>✕</button>
+    <button id="btnOpen" class="btn ghost" type="button" title="Anderes PDF öffnen"><span class="ic">＋</span> PDF</button>
     <div class="filename" id="fileName">PDF Datenschutz</div>
     <button id="btnSettings" class="btn ghost icon" type="button" aria-label="Einstellungen">⚙︎</button>
     <input id="fileInput" type="file" accept="application/pdf,.pdf" hidden>
@@ -53,13 +54,13 @@
   <div class="sheet-spacer" id="spacer" hidden></div>
 
   <section class="sheet" id="sheet" hidden>
-    <button class="sheet-head" id="sheetHead" type="button" aria-expanded="false">
-      <span class="grip" aria-hidden="true"></span>
-      <span class="summary" id="summary"></span>
-      <span class="chev" aria-hidden="true">⌃</span>
-    </button>
-    <div class="primary-row">
-      <button id="btnPrimary" class="btn primary wide" type="button">Anwenden</button>
+    <span class="grip" aria-hidden="true"></span>
+    <div class="sheet-bar" id="sheetBar">
+      <button id="btnPrimary" class="btn primary" type="button">Anwenden</button>
+      <button class="sheet-head" id="sheetHead" type="button" aria-expanded="false" aria-label="Liste öffnen oder schließen">
+        <span class="summary" id="summary"></span>
+        <span class="chev" aria-hidden="true">⌃</span>
+      </button>
     </div>
     <div class="sheet-body" id="sheetBody">
       <div class="verify" id="verify" hidden></div>
