@@ -53,6 +53,16 @@ Die Liste ist zweigeteilt:
 „Ansprechpartner:“). Im Zweifel zählt ein Fund zu deinen Daten. Bei jedem Fund kannst du die Zuordnung mit
 **„↺ Gehört zum Absender / zu meinen Daten“** umstellen.
 
+### Gleicher Wert = überall gleich behandelt
+
+Ist ein Wert einmal als eigene Daten erkannt (z. B. die Kundennummer auf Seite 1), gilt das für **jede** Stelle im
+Dokument, auch wenn er auf Seite 2 in einer Kopf- oder Fußzeile des Absenders steht. In einer behaltenen Fußzeile wird
+dann nur deine Nummer bzw. dein Name ersetzt, der Rest der Fußzeile bleibt.
+
+Zusätzlich gibt es beim Anwenden eine **Sicherheitsrunde**: Jeder Wert, der entfernt wird, wird im ganzen Dokument
+gesucht, und jede noch nicht bearbeitete Stelle wird mit entfernt. Meldet der Prüfbericht trotzdem einen Rest, steht
+dort, auf welcher Seite er ist, und der Knopf **„Rest entfernen“** beseitigt ihn sofort.
+
 ## Adressen als Block
 
 Zusammengehörige Angaben werden als **ein Fund** behandelt, nicht einzeln nach Straße, PLZ und Ort:
@@ -87,6 +97,14 @@ Die Erkennung ist bewusst großzügig: Lieber ein Fund zu viel in der Liste als 
 - **Die Tabelle enthält keine Originalwerte.** Gespeichert werden nur ein nicht umkehrbarer Fingerabdruck
   (SHA-256 mit geräteeigenem Zufallswert), der Ersatzwert und ein gekürzter Hinweis wie `DE…00`.
 - Unter ⚙︎ kannst du die Tabelle ansehen, einzelne Einträge löschen, sie als Datei **sichern** und **wiederherstellen**.
+
+## Bedienung auf dem iPhone
+
+- Unten sitzt eine **schmale Leiste**: links der Hauptknopf (*Anwenden* → *Speichern*), daneben die Zusammenfassung.
+  Antippen oder **nach oben wischen** öffnet die Liste, antippen, **nach unten wischen** oder auf das Dokument tippen
+  schließt sie. Die Leiste verdeckt die Seite und die Werkzeugleiste nicht.
+- **✕** oben links schließt das Dokument (mit Rückfrage, falls das Ergebnis noch nicht gespeichert ist), **＋ PDF**
+  öffnet ein anderes.
 
 ## Viewer: Seiten und Lupe
 

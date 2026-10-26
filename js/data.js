@@ -10,6 +10,9 @@ export const FIRST_NAMES_F = [
   'Marie', 'Marina', 'Marion', 'Martina', 'Melanie', 'Mia', 'Michaela', 'Monika', 'Nadine', 'Natalie', 'Nicole', 'Nina',
   'Petra', 'Renate', 'Ruth', 'Sabine', 'Sabrina', 'Sandra', 'Sara', 'Sarah', 'Silke', 'Simone', 'Sofia', 'Sophie', 'Stefanie',
   'Stephanie', 'Susanne', 'Svenja', 'Tanja', 'Ursula', 'Ute', 'Vanessa', 'Vera', 'Verena', 'Yvonne',
+  'Anke', 'Astrid', 'Bärbel', 'Bianca', 'Christel', 'Elke', 'Gudrun', 'Hannelore', 'Heidi', 'Helene', 'Irene', 'Jennifer',
+  'Karla', 'Kirsten', 'Liane', 'Lilli', 'Lotte', 'Marlene', 'Martha', 'Nora', 'Paula', 'Rita', 'Rosemarie', 'Sigrid',
+  'Silvia', 'Sonja', 'Tina', 'Waltraud', 'Annika', 'Jule', 'Merle', 'Leonie', 'Greta', 'Ida', 'Clara', 'Mila', 'Ronja',
 ];
 
 export const FIRST_NAMES_M = [
@@ -22,6 +25,9 @@ export const FIRST_NAMES_M = [
   'Oliver', 'Oskar', 'Patrick', 'Paul', 'Peter', 'Philipp', 'Rainer', 'Ralf', 'René', 'Richard', 'Robert', 'Roland', 'Rolf',
   'Sebastian', 'Simon', 'Stefan', 'Stephan', 'Sven', 'Thomas', 'Thorsten', 'Tim', 'Tobias', 'Tom', 'Torsten', 'Udo', 'Uwe',
   'Volker', 'Walter', 'Werner', 'Wolfgang', 'Yannick',
+  'Jochen', 'Rüdiger', 'Hartmut', 'Bernhard', 'Gerd', 'Gunter', 'Reinhard', 'Wilfried', 'Siegfried', 'Ulrich', 'Gregor',
+  'Hubert', 'Karsten', 'Kurt', 'Lothar', 'Ludwig', 'Marius', 'Nico', 'Olaf', 'Pascal', 'Reiner', 'Sascha', 'Steffen',
+  'Timo', 'Till', 'Vincent', 'Wilhelm', 'Gerhard', 'Hendrik', 'Jakob', 'Mats', 'Ole', 'Theo', 'Hannes', 'Malte', 'Arne',
 ];
 
 // Häufige Nachnamen – nur für Ersatzwerte, nicht für die Erkennung
