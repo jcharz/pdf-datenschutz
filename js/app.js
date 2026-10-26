@@ -2,7 +2,8 @@
 
 import * as pdfjsLib from '../vendor/pdfjs/pdf.min.mjs';
 import { termPattern, parseCommand, findMatches, valueKey, normalize, SHORT } from './detect.js';
-import { buildPageModel, segmentsForRange, findImages } from './pdfmodel.js';
+import { buildPageModel, buildOcrModel, segmentsForRange, findImages } from './pdfmodel.js';
+import { ocrPage } from './ocr.js';
 import { analyzeDocument } from './structure.js';
 import { redactPdf, verifyResult } from './redact.js';
 import { PageViewer } from './viewer.js';
@@ -20,14 +21,15 @@ const PDF_OPTS = {
 
 const $ = (id) => document.getElementById(id);
 const ui = {
-  open: $('btnOpen'), open2: $('btnOpen2'), close: $('btnClose'), sheetBar: $('sheetBar'), fileInput: $('fileInput'), fileName: $('fileName'),
+  open: $('btnOpen'), open2: $('btnOpen2'), close: $('btnClose'), sheetBar: $('sheetBar'),
+  markBar: $('markBar'), mkUndo: $('mkUndo'), mkDelete: $('mkDelete'), mkPrev: $('mkPrev'), mkNext: $('mkNext'), mkDone: $('mkDone'), fileInput: $('fileInput'), fileName: $('fileName'),
   empty: $('empty'), viewer: $('viewer'), toolbar: $('toolbar'), spacer: $('spacer'),
   zoom: $('btnZoom'), mark: $('btnMark'), tabOriginal: $('tabOriginal'), tabResult: $('tabResult'), pageInfo: $('pageInfo'),
   sheet: $('sheet'), sheetHead: $('sheetHead'), summary: $('summary'), primary: $('btnPrimary'), scrim: $('scrim'),
   body: $('sheetBody'), verify: $('verify'), hintForm: $('hintForm'), hintInput: $('hintInput'),
   filters: $('filters'), bulk: $('bulk'), list: $('findings'),
   saveDlg: $('saveDlg'), saveName: $('saveName'), saveHint: $('saveHint'),
-  settings: $('settings'), btnSettings: $('btnSettings'), setDefault: $('setDefault'), setLow: $('setLow'), setSender: $('setSender'),
+  settings: $('settings'), btnSettings: $('btnSettings'), setDefault: $('setDefault'), setLow: $('setLow'), setSender: $('setSender'), setOcr: $('setOcr'),
   setDpi: $('setDpi'), setRasterAll: $('setRasterAll'), tableBox: $('tableBox'), templateBox: $('templateBox'),
   btnExport: $('btnExport'), btnImport: $('btnImport'), btnClearTable: $('btnClearTable'), importInput: $('importInput'),
   toast: $('toast'),
@@ -49,13 +51,14 @@ const state = {
   filter: 'alle',
   busy: false,
   hints: [], // angewendete Hinweise (für Schablonen)
+  areaHistory: [], // Schritte beim Markieren (für „Rückgängig“)
   templateOffer: null, // { template, score, dismissed, applied }
   templateId: null,
 };
 
 const SETTINGS_KEY = 'pdfprivacy.settings';
 const settings = (() => {
-  const def = { defaultAction: 'redact', preselectLow: false, preselectSender: false, dpi: 200, rasterAll: false };
+  const def = { defaultAction: 'redact', preselectLow: false, preselectSender: false, dpi: 200, rasterAll: false, ocr: true };
   try { return { ...def, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') }; } catch { return def; }
 })();
 function storeSettings() {
@@ -70,6 +73,8 @@ const viewer = new PageViewer(ui.viewer, {
   onChange: renderToolbar,
   onTapShape: (id) => { const f = findingByShape(id); if (f) { state.focusId = f.id; renderOverlays(); focusFinding(f); } },
   onDraw: addManualArea,
+  onAreaChange: updateArea,
+  onSelect: () => renderMarkBar(),
 });
 
 let seq = 0;
@@ -103,6 +108,7 @@ function toast(text, ms = 3200) {
 
 function busy(text) {
   ui.summary.replaceChildren(el('span', { class: 'busy-line' }, text));
+  ui.primary.disabled = true; // während Lesen/Erkennen/Prüfen nichts anwenden
 }
 
 function reportError(e, msg = 'Fehler') {
@@ -142,7 +148,7 @@ async function openFile(file, handle = null) {
 
     await clearResult();
     await state.doc?.destroy();
-    Object.assign(state, { file: { name: file.name || 'dokument.pdf', bytes, handle }, doc, models: [], findings: [], notices: [], filter: 'alle', hints: [], templateOffer: null, templateId: null });
+    Object.assign(state, { file: { name: file.name || 'dokument.pdf', bytes, handle }, doc, models: [], findings: [], notices: [], filter: 'alle', hints: [], templateOffer: null, templateId: null, areaHistory: [] });
     pseudo = new Pseudonymizer(table);
     ui.fileName.textContent = state.file.name;
     ui.empty.hidden = true;
@@ -154,10 +160,32 @@ async function openFile(file, handle = null) {
       busy(`Lese Seite ${i} von ${doc.numPages} …`);
       state.models.push(await buildPageModel(await doc.getPage(i)));
     }
+    await runOcr(doc);
     busy('Suche nach kritischen Daten …');
     await analyze();
   } catch (e) {
     reportError(e, 'Das PDF konnte nicht geöffnet werden.');
+  }
+}
+
+/** Seiten ohne Textebene (Scans, Fotos) per Texterkennung lesen – auf dem Gerät. */
+async function runOcr(doc) {
+  if (!settings.ocr) return;
+  const scans = state.models.map((m, i) => (m.text.replace(/\s/g, '').length < 25 ? i : -1)).filter((i) => i >= 0);
+  for (const [k, i] of scans.entries()) {
+    const label = `Texterkennung Seite ${i + 1}${scans.length > 1 ? ` (${k + 1} von ${scans.length})` : ''}`;
+    busy(`${label} …`);
+    try {
+      const page = await doc.getPage(i + 1);
+      const res = await ocrPage(page, (m) => {
+        if (m.status === 'recognizing text') busy(`${label} … ${Math.round(m.progress * 100)} %`);
+        else if (/load/i.test(m.status)) busy(`Texterkennung wird vorbereitet (einmalig) …`);
+      });
+      if (res.lines.length) state.models[i] = buildOcrModel(page, state.models[i], res);
+    } catch (e) {
+      console.error(e);
+      state.notices.push(`Texterkennung auf Seite ${i + 1} fehlgeschlagen (${e.message || e}). Bitte Bereiche mit ▭ markieren.`);
+    }
   }
 }
 
@@ -204,6 +232,12 @@ async function analyze() {
       }));
     }
   }
+  state.models.forEach((m, i) => {
+    if (m.ocr) {
+      state.notices.push(`Seite ${i + 1} ist ein Scan und wurde per Texterkennung gelesen (Sicherheit ${Math.round(m.ocr.confidence)} %). `
+        + 'Bitte die Funde kurz prüfen – was fehlt, mit ▭ markieren oder als Hinweis eingeben.');
+    }
+  });
   if (!state.models.some((m) => m.text.trim()) && !state.notices.length) {
     state.notices.push('Dieses PDF enthält keinen lesbaren Text (eingescannt?). Bitte Bereiche mit ▭ von Hand markieren.');
   }
@@ -262,8 +296,63 @@ async function addManualArea(page, quad) {
   const f = manualFinding(page, quad);
   f.sigBase = await findingSignature(f, state.models, table.data.salt);
   state.findings.unshift(f);
+  state.areaHistory.push({ type: 'add', id: f.id });
   changed();
-  toast('Bereich wird geschwärzt. Weitere Bereiche ziehen oder ▭ beenden.');
+  viewer.select(f.id); // gleich anpassen: verschieben, Ecken ziehen
+}
+
+// ---------------------------------------------------------------------------
+// Markierte Bereiche bearbeiten: verschieben, Größe ändern, löschen, rückgängig
+// ---------------------------------------------------------------------------
+
+/** Lage eines Bereichs setzen (Viereck in PDF-Koordinaten) und abhängige Werte aktualisieren. */
+function setAreaQuad(f, quad) {
+  const o = f.occurrences[0];
+  const m = state.models[o.page];
+  o.segments = [{ quad }];
+  o.quads = [quad];
+  const xs = quad.map((p) => p[0]), ys = quad.map((p) => p[1]);
+  f.rel = [Math.min(...xs) / m.width, Math.min(...ys) / m.height, Math.max(...xs) / m.width, Math.max(...ys) / m.height];
+}
+
+function updateArea(id, quad) {
+  const f = state.findings.find((x) => x.id === id && x.cat === 'manual');
+  if (!f) return;
+  state.areaHistory.push({ type: 'change', id, before: f.occurrences[0].quads[0] });
+  setAreaQuad(f, quad);
+  changed();
+}
+
+function deleteSelectedArea() {
+  const id = viewer.selectedId;
+  const i = state.findings.findIndex((x) => x.id === id && x.cat === 'manual');
+  if (i < 0) return;
+  state.areaHistory.push({ type: 'delete', finding: state.findings[i], index: i });
+  state.findings.splice(i, 1);
+  viewer.select(null);
+  changed();
+}
+
+function undoArea() {
+  const h = state.areaHistory.pop();
+  if (!h) return toast('Nichts zum Rückgängigmachen.');
+  if (h.type === 'add') {
+    state.findings = state.findings.filter((x) => x.id !== h.id);
+    viewer.select(null);
+  } else if (h.type === 'change') {
+    const f = state.findings.find((x) => x.id === h.id);
+    if (f) { setAreaQuad(f, h.before); viewer.select(f.id); }
+  } else if (h.type === 'delete') {
+    state.findings.splice(Math.min(h.index, state.findings.length), 0, h.finding);
+    viewer.select(h.finding.id);
+  }
+  changed();
+}
+
+function renderMarkBar() {
+  ui.markBar.hidden = !viewer.markMode;
+  ui.mkUndo.disabled = !state.areaHistory.length;
+  ui.mkDelete.disabled = !state.findings.some((x) => x.id === viewer.selectedId && x.cat === 'manual');
 }
 
 /**
@@ -556,6 +645,7 @@ function switchOwner(f) {
 }
 
 function removeFinding(f) {
+  if (f.cat === 'manual') state.areaHistory.push({ type: 'delete', finding: f, index: state.findings.indexOf(f) });
   state.findings = state.findings.filter((x) => x !== f);
   changed();
 }
@@ -564,6 +654,10 @@ function renderOverlays() {
   const shapes = [];
   if (state.view === 'original') {
     for (const f of state.findings) {
+      if (f.cat === 'manual') {
+        for (const o of f.occurrences) for (const quad of o.quads) shapes.push({ page: o.page, quad, cls: 'hit redact manual-area', id: f.id, editable: true });
+        continue;
+      }
       for (const o of f.occurrences) {
         // Vorschau des Ersatzwerts als kleines Schild über der Stelle
         // nur für den gerade angetippten Fund – sonst würden Schilder den Originaltext verdecken
@@ -576,6 +670,7 @@ function renderOverlays() {
     }
   }
   viewer.setOverlays(shapes);
+  renderMarkBar();
 }
 
 function findingByShape(id) {
@@ -658,7 +753,7 @@ async function closeDocument() {
   await clearResult();
   viewer.clear();
   await state.doc.destroy();
-  Object.assign(state, { file: null, doc: null, models: [], findings: [], notices: [], hints: [], templateOffer: null, templateId: null, focusId: null, saved: false });
+  Object.assign(state, { file: null, doc: null, models: [], findings: [], notices: [], hints: [], templateOffer: null, templateId: null, focusId: null, saved: false, areaHistory: [] });
   ui.fileName.textContent = 'PDF Datenschutz';
   for (const x of [ui.viewer, ui.toolbar, ui.sheet, ui.spacer, ui.close]) x.hidden = true;
   ui.empty.hidden = false;
@@ -806,6 +901,9 @@ async function applyAll({ rasterAll = settings.rasterAll } = {}) {
 
     await clearResult();
     const doc = await pdfjsLib.getDocument({ ...PDF_OPTS, data: bytes.slice() }).promise;
+    // Scans: Die Textebene sagt nichts über die Pixel – das Ergebnis noch einmal per Texterkennung lesen
+    report.leftInImage = await verifyImages(doc, redactions, active, keptTexts);
+    if (report.leftInImage.length) report.ok = false;
     state.result = { bytes, doc, report, stats, replacements, swept };
     state.saved = false;
     state.stale = false;
@@ -856,6 +954,107 @@ function splitAcrossLines(o, fake) {
   return rows.map((r, k) => ({ segments: r.segments, text: parts[k] }));
 }
 
+const squashText = (t) => t.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+
+const bboxOf = (q) => [Math.min(...q.map((p) => p[0])), Math.min(...q.map((p) => p[1])), Math.max(...q.map((p) => p[0])), Math.max(...q.map((p) => p[1]))];
+const overlap = (a, b) => a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
+
+/** Länge der längsten gemeinsamen Zeichenfolge. */
+function longestCommon(a, b) {
+  let best = 0;
+  const prev = new Array(b.length + 1).fill(0);
+  for (let i = 1; i <= a.length; i++) {
+    let diag = 0;
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = prev[j];
+      prev[j] = a[i - 1] === b[j - 1] ? diag + 1 : 0;
+      if (prev[j] > best) best = prev[j];
+      diag = tmp;
+    }
+  }
+  return best;
+}
+
+/**
+ * Prüft bearbeitete Scan-Seiten im Ergebnis per Texterkennung: Ist ein entfernter Wert im Bild noch lesbar?
+ * Rückgabe: [{ text, page, quad }] – quad = Fundstelle (PDF-Koordinaten der Originalseite) zum Nachschwärzen.
+ */
+async function verifyImages(doc, redactions, active, keptTexts) {
+  const pages = [...redactions.keys()].filter((p) => state.models[p]?.ocr);
+  if (!pages.length) return [];
+  const kept = keptTexts.map(squashText).filter(Boolean);
+  const out = [];
+  for (const p of pages) {
+    busy(`Prüfe Seite ${p + 1} per Texterkennung …`);
+    const needles = [...new Set(active.flatMap((f) => f.occurrences.filter((o) => o.page === p)
+      .flatMap((o) => (o.parts?.length ? o.parts.map((x) => x.text) : [o.text]))))]
+      .filter((t) => !SALUTATION_ONLY.test(t.trim()))
+      .map((t) => ({ t, q: squashText(t) }))
+      .filter(({ q }) => q.length >= 5 && !kept.some((k) => k.includes(q)));
+    if (!needles.length) continue;
+    try {
+      const res = await ocrPage(await doc.getPage(p + 1));
+      const words = res.lines.flatMap((l) => l.words);
+      const flat = words.map((w) => squashText(w.text));
+      // Zufällige Ähnlichkeiten (z. B. Telefonnummer „0221 2345-678“ oder USt-IdNr. „DE123456789“ ähneln
+      // „A123456789“) sind kein Rest – erkennbar daran, dass das ähnliche Wort im Original an derselben Stelle stand.
+      const model = state.models[p];
+      const [ox, oy] = model.origin || [0, 0];
+      const removedItems = new Set();
+      for (const f of active) for (const o of f.occurrences) {
+        if (o.page !== p || o.start === undefined) continue;
+        for (let k = o.start; k < o.end; k++) if (model.map[k]?.[0] >= 0) removedItems.add(model.map[k][0]);
+      }
+      const keptItems = model.items.filter((it, k) => !removedItems.has(k) && it.box).map((it) => ({ q: squashText(it.str), bb: bboxOf(it.box) }));
+      // auch mehrere Wörter hintereinander (z. B. „0012 3456“ aus einer IBAN der Fußzeile)
+      const origItems = [];
+      for (let i = 0; i < keptItems.length; i++) {
+        let q = '', bb = null;
+        for (let n = 0; n < 4 && i + n < keptItems.length; n++) {
+          const it = keptItems[i + n];
+          // nur Wörter derselben Zeile zusammenfassen
+          if (bb && (it.bb[1] > bb[3] || it.bb[3] < bb[1])) break;
+          q += it.q;
+          bb = bb ? [Math.min(bb[0], it.bb[0]), Math.min(bb[1], it.bb[1]), Math.max(bb[2], it.bb[2]), Math.max(bb[3], it.bb[3])] : it.bb;
+          origItems.push({ q, bb });
+        }
+      }
+      const toPdf = (ws) => {
+        const [x0, y0, x1, y1] = [Math.min(...ws.map((w) => w.x0)), Math.min(...ws.map((w) => w.y0)), Math.max(...ws.map((w) => w.x1)), Math.max(...ws.map((w) => w.y1))];
+        return [[x0 - 6, y1 + 6], [x1 + 6, y1 + 6], [x1 + 6, y0 - 6], [x0 - 6, y0 - 6]]
+          .map(([x, y]) => res.view.convertToPdfPoint(x, y)).map(([x, y]) => [x + ox, y + oy]);
+      };
+      const found = [];
+      for (const { t, q } of needles) {
+        // Auch teilweise lesbare Werte zählen (z. B. „123456789“ übrig von „A123456789“)
+        const need = Math.max(5, Math.ceil(q.length * 0.6));
+        let best = null;
+        for (let i = 0; i < words.length; i++) {
+          let acc = '';
+          for (let n = 0; n < 4 && i + n < words.length; n++) {
+            acc += flat[i + n];
+            const len = longestCommon(acc, q);
+            if (len < need) continue;
+            const quad = toPdf(words.slice(i, i + n + 1));
+            const bb = bboxOf(quad);
+            // ähnliches Wort stand schon im Original dort, oder es ist der Ersatzwert (z. B. Datum 03.05. → 15.05.)
+            const coincidence = origItems.some((o) => overlap(o.bb, bb) && longestCommon(o.q, q) >= len - 1)
+              || kept.some((k) => longestCommon(acc, k) >= len);
+            if (coincidence) continue;
+            if (!best || len > best.len || (len === best.len && n + 1 < best.n)) best = { len, n: n + 1, quad, text: words.slice(i, i + n + 1).map((w) => w.text).join(' ') };
+          }
+        }
+        if (best) found.push({ text: t, page: p, quad: best.quad, len: best.len });
+      }
+      // dieselbe Stelle nur einmal melden (für den Wert, der am besten passt)
+      for (const f of found.sort((a, b) => b.len - a.len)) {
+        if (!out.some((x) => x.page === p && overlap(bboxOf(x.quad), bboxOf(f.quad)))) out.push({ text: f.text, page: p, quad: f.quad });
+      }
+    } catch (e) { console.error(e); }
+  }
+  return out;
+}
+
 /** Wo steht ein Text im Original? (Seitenzahlen für den Prüfbericht) */
 function pagesOf(text) {
   return [...new Set(findExact(text).map((h) => h.page + 1))];
@@ -866,15 +1065,16 @@ function renderReport() {
   ui.verify.hidden = false;
   ui.verify.replaceChildren();
   const c = counts();
-  const left = [...new Set([...report.leftInText, ...report.leftInRaw])];
+  const left = [...new Set([...report.leftInText, ...report.leftInRaw, ...(report.leftInImage || []).map((x) => x.text)])];
   if (report.ok) {
     ui.verify.append(el('div', { class: 'report-head ok' }, '✓ Geprüft: Keine der entfernten Angaben steht mehr im neuen PDF.'));
   } else {
     ui.verify.append(el('div', { class: 'report-head bad' },
       `✗ ${left.length === 1 ? 'Eine Angabe steht' : `${left.length} Angaben stehen`} noch im PDF:`,
       el('ul', { class: 'leftovers' }, left.map((t) => {
-        const pg = pagesOf(t);
-        return el('li', {}, el('b', {}, t), pg.length ? ` (Seite ${pg.join(', ')})` : '');
+        const img = (report.leftInImage || []).filter((x) => x.text === t);
+        const pg = img.length ? [...new Set(img.map((x) => x.page + 1))] : pagesOf(t);
+        return el('li', {}, el('b', {}, t), pg.length ? ` (Seite ${pg.join(', ')})` : '', img.length ? ' – im Bild noch lesbar' : '');
       })),
       el('div', { class: 'actions-row' },
         el('button', { type: 'button', class: 'btn primary small', onclick: () => fixLeftovers(left) }, 'Diese Stellen auch entfernen'),
@@ -907,6 +1107,12 @@ function renderReport() {
 
 /** Reste aus dem Prüfbericht: Fundstellen im Original suchen, als eigene Daten schwärzen und neu anwenden. */
 async function fixLeftovers(list) {
+  // Im Scan-Bild noch lesbar → genau diese Stelle (mit Rand) zusätzlich schwärzen
+  for (const x of state.result?.report.leftInImage || []) {
+    const f = manualFinding(x.page, x.quad);
+    f.label = 'Nachgeschwärzt (Scan)';
+    state.findings.unshift(f);
+  }
   for (const t of list) {
     const hits = findExact(t).filter((h) => !coveredByActive(h.page, h.start, h.end));
     for (const f of state.findings) {
@@ -946,7 +1152,8 @@ async function setView(view) {
 function setMarkMode(on) {
   viewer.setMarkMode(on);
   ui.mark.setAttribute('aria-pressed', String(on));
-  if (on) { openSheet(false); toast('Rahmen um den Bereich ziehen, der geschwärzt werden soll. Wischen ist jetzt aus.', 4000); }
+  if (on) openSheet(false);
+  renderMarkBar();
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,6 +1246,7 @@ function openSettings() {
   ui.setDefault.value = settings.defaultAction;
   ui.setLow.checked = settings.preselectLow;
   ui.setSender.checked = settings.preselectSender;
+  ui.setOcr.checked = settings.ocr;
   ui.setDpi.value = String(settings.dpi);
   ui.setRasterAll.checked = settings.rasterAll;
   renderTable();
@@ -1051,6 +1259,7 @@ ui.settings.addEventListener('close', () => {
   settings.defaultAction = ui.setDefault.value;
   settings.preselectLow = ui.setLow.checked;
   settings.preselectSender = ui.setSender.checked;
+  settings.ocr = ui.setOcr.checked;
   settings.dpi = Number(ui.setDpi.value);
   settings.rasterAll = ui.setRasterAll.checked;
   storeSettings();
@@ -1092,6 +1301,11 @@ ui.btnClearTable.addEventListener('click', () => {
 
 ui.open.addEventListener('click', pickFile);
 ui.close.addEventListener('click', closeDocument);
+ui.mkUndo.addEventListener('click', undoArea);
+ui.mkDelete.addEventListener('click', deleteSelectedArea);
+ui.mkPrev.addEventListener('click', () => viewer.prev());
+ui.mkNext.addEventListener('click', () => viewer.next());
+ui.mkDone.addEventListener('click', () => setMarkMode(false));
 ui.open2.addEventListener('click', pickFile);
 ui.fileInput.addEventListener('change', () => {
   const f = ui.fileInput.files[0];
@@ -1128,6 +1342,8 @@ document.addEventListener('keydown', (e) => {
   if (!state.doc || e.target.closest('input, textarea, select, dialog')) return;
   const map = { ArrowRight: 'next', ArrowLeft: 'prev', ArrowDown: 'down', ArrowUp: 'up' };
   if (map[e.key]) { e.preventDefault(); viewer[map[e.key]](); }
+  if (viewer.markMode && (e.key === 'Delete' || e.key === 'Backspace')) { e.preventDefault(); deleteSelectedArea(); return; }
+  if (viewer.markMode && e.key === 'z' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); undoArea(); return; }
   if (e.key === 'z') viewer.toggleZoom(0);
 });
 
@@ -1146,4 +1362,4 @@ if ('serviceWorker' in navigator && location.protocol === 'https:') {
 }
 
 // Für automatisierte Tests
-window.__pdfPrivacy = { state, viewer, table, templates, openFile, applyAll, applyHint, setAction, applyTemplate, saveTemplate, fixLeftovers };
+window.__pdfPrivacy = { undoArea, deleteSelectedArea, state, viewer, table, templates, openFile, applyAll, applyHint, setAction, applyTemplate, saveTemplate, fixLeftovers };

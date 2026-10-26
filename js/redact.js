@@ -63,27 +63,35 @@ function lowContrast(ctx, vp, q) {
 
 /** Ersatztext an die Stelle des Originals malen (gleiche Grundlinie, Größe, Drehung, Farbe). */
 function paintReplacement(ctx, vp, rep) {
-  const quads = rep.segments.map((s) => s.quad);
+  const quads = rep.segments.map((s) => s.fill || s.quad);
   const { bg, fg } = sampleColors(ctx, vp, quads);
   ctx.fillStyle = bg;
   for (const q of quads) { polyPath(ctx, vp, q); ctx.fill(); }
-  const g = rep.segments.find((s) => s.geom)?.geom;
+  const firstSeg = rep.segments.find((s) => s.geom);
+  const g = firstSeg?.geom;
   if (!g || !rep.text) return;
+  const text = (firstSeg.prefix || '') + rep.text + (rep.segments[rep.segments.length - 1].suffix || '');
   const sameLine = rep.segments.filter((s) => s.geom && Math.abs(s.geom.baseline[1] - g.baseline[1]) < g.size * 0.5);
   const avail = sameLine.reduce((n, s) => n + s.geom.width, 0) || g.width;
   const [bx, by] = vp.convertToViewportPoint(...g.baseline);
-  const px = g.size * vp.scale;
+  let px = g.size * vp.scale;
+  if (g.cap) {
+    // Scan: Schriftgröße so wählen, dass die Großbuchstaben so hoch sind wie im Original
+    ctx.font = `100px ${g.family}`;
+    const asc = ctx.measureText('H').actualBoundingBoxAscent || 72;
+    px = (g.cap * vp.scale * 100) / asc;
+  }
   ctx.save();
   ctx.translate(bx, by);
   ctx.rotate(-g.angle);
   ctx.font = `${px}px ${g.family}`;
-  const textW = ctx.measureText(rep.text).width;
+  const textW = ctx.measureText(text).width;
   const maxW = avail * vp.scale * 1.08;
   if (textW > maxW) ctx.scale(Math.max(0.6, maxW / textW), 1);
   else if (textW < avail * vp.scale * 0.92) ctx.scale(Math.min(1.12, (avail * vp.scale) / textW), 1); // Lücke verkleinern
   ctx.fillStyle = fg;
   ctx.textBaseline = 'alphabetic';
-  ctx.fillText(rep.text, 0, 0);
+  ctx.fillText(text, 0, 0);
   ctx.restore();
 }
 

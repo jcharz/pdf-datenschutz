@@ -7,11 +7,14 @@ const ZOOM = 2;
 const SWIPE = 45; // Pixel
 
 export class PageViewer {
-  constructor(el, { onChange, onTapShape, onDraw } = {}) {
+  constructor(el, { onChange, onTapShape, onDraw, onAreaChange, onSelect } = {}) {
     this.el = el;
     this.onChange = onChange;
     this.onTapShape = onTapShape;
     this.onDraw = onDraw;
+    this.onAreaChange = onAreaChange;
+    this.onSelect = onSelect;
+    this.selectedId = null;
     this.doc = null;
     this.index = 0;
     this.zoom = false;
@@ -232,6 +235,7 @@ export class PageViewer {
     }
     // Schilder mit Ersatzwerten zuletzt, damit sie über allen Markierungen liegen
     for (const s of this.shapes) if (s.tag && s.page === this.index) this.svg.append(this.makeTag(s));
+    if (this.markMode) this.drawHandles();
   }
 
   /** Kleines Schild mit dem Ersatzwert über der markierten Stelle. */
@@ -261,11 +265,68 @@ export class PageViewer {
   setMarkMode(on) {
     this.markMode = on;
     this.el.classList.toggle('marking', on);
+    if (!on) this.selectedId = null;
+    this.drawShapes();
   }
 
   // -------------------------------------------------------------------------
   // Gesten: Wischen, Tippen, Doppeltippen, Rahmen ziehen
   // -------------------------------------------------------------------------
+
+  // -------------------------------------------------------------------------
+  // Markierte Bereiche bearbeiten (nur im Markiermodus): antippen = auswählen,
+  // innen ziehen = verschieben, Ecke ziehen = Größe ändern, auf freier Fläche ziehen = neuer Bereich
+  // -------------------------------------------------------------------------
+
+  /** Rechteck (Seitenansicht-Einheiten) einer Markierung. */
+  areaRect(shape) {
+    const pts = shape.quad.map(([x, y]) => this.vp1.convertToViewportPoint(x, y));
+    const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+    return { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) };
+  }
+
+  editableAt([x, y]) {
+    const areas = this.shapes.filter((s) => s.page === this.index && s.editable);
+    for (let i = areas.length - 1; i >= 0; i--) {
+      const r = this.areaRect(areas[i]);
+      if (x >= r.x0 && x <= r.x1 && y >= r.y0 && y <= r.y1) return areas[i];
+    }
+    return null;
+  }
+
+  /** Griffgröße in Seiteneinheiten, damit sie auf dem Bildschirm immer gleich groß ist (ca. 22 px). */
+  handleSize() {
+    const w = this.svg.getBoundingClientRect().width || 1;
+    return (11 * this.vp1.width) / w;
+  }
+
+  select(id) {
+    this.selectedId = id;
+    this.drawShapes();
+    this.onSelect?.(id);
+  }
+
+  rectToQuad({ x0, y0, x1, y1 }) {
+    return [[x0, y1], [x1, y1], [x1, y0], [x0, y0]].map(([x, y]) => this.vp1.convertToPdfPoint(x, y));
+  }
+
+  drawHandles() {
+    const s = this.shapes.find((x) => x.id === this.selectedId && x.page === this.index && x.editable);
+    if (!s) return;
+    const r = this.areaRect(s);
+    const h = this.handleSize();
+    const frame = document.createElementNS(SVG, 'rect');
+    frame.setAttribute('class', 'sel-frame');
+    frame.setAttribute('x', r.x0); frame.setAttribute('y', r.y0);
+    frame.setAttribute('width', r.x1 - r.x0); frame.setAttribute('height', r.y1 - r.y0);
+    this.svg.append(frame);
+    for (const [cx, cy] of [[r.x0, r.y0], [r.x1, r.y0], [r.x1, r.y1], [r.x0, r.y1]]) {
+      const c = document.createElementNS(SVG, 'circle');
+      c.setAttribute('class', 'handle');
+      c.setAttribute('cx', cx); c.setAttribute('cy', cy); c.setAttribute('r', h * 0.55);
+      this.svg.append(c);
+    }
+  }
 
   bindGestures() {
     let start = null, lastTap = 0, rect = null;
@@ -278,22 +339,59 @@ export class PageViewer {
       if (!this.vp1 || (ev.pointerType === 'mouse' && ev.button !== 0)) return;
       this.el.setPointerCapture(ev.pointerId);
       start = { x: ev.clientX, y: ev.clientY, t: performance.now(), target: ev.target };
-      if (this.markMode) {
-        start.p = svgPoint(ev);
-        rect = document.createElementNS(SVG, 'rect');
-        rect.setAttribute('class', 'drawing');
-        this.svg.append(rect);
+      if (!this.markMode) return;
+      const p = svgPoint(ev);
+      start.p = p;
+      // 1. Ecke der ausgewählten Markierung → Größe ändern
+      const sel = this.shapes.find((x) => x.id === this.selectedId && x.page === this.index && x.editable);
+      if (sel) {
+        const r = this.areaRect(sel);
+        const h = this.handleSize() * 1.4;
+        const corners = [[r.x0, r.y0], [r.x1, r.y0], [r.x1, r.y1], [r.x0, r.y1]];
+        const k = corners.findIndex(([cx, cy]) => Math.hypot(cx - p[0], cy - p[1]) <= h);
+        if (k >= 0) { start.mode = 'resize'; start.corner = k; start.rect = r; start.shape = sel; return; }
       }
+      // 2. in einer Markierung → auswählen und verschieben
+      const hit = this.editableAt(p);
+      if (hit) {
+        if (hit.id !== this.selectedId) this.select(hit.id);
+        start.mode = 'move'; start.rect = this.areaRect(hit); start.shape = hit;
+        return;
+      }
+      // 3. freie Fläche → neuen Bereich aufziehen
+      start.mode = 'draw';
+      rect = document.createElementNS(SVG, 'rect');
+      rect.setAttribute('class', 'drawing');
+      this.svg.append(rect);
     });
+
+    const liveRect = (ev, st = start) => {
+      const [x, y] = svgPoint(ev);
+      const dx = x - st.p[0], dy = y - st.p[1];
+      let { x0, y0, x1, y1 } = st.rect;
+      if (st.mode === 'move') { x0 += dx; x1 += dx; y0 += dy; y1 += dy; }
+      else {
+        if (st.corner === 0 || st.corner === 3) x0 += dx; else x1 += dx;
+        if (st.corner === 0 || st.corner === 1) y0 += dy; else y1 += dy;
+      }
+      return { x0: Math.min(x0, x1), y0: Math.min(y0, y1), x1: Math.max(x0, x1), y1: Math.max(y0, y1) };
+    };
 
     this.el.addEventListener('pointermove', (ev) => {
       if (!start) return;
       if (this.markMode) {
-        const [x, y] = svgPoint(ev);
-        rect.setAttribute('x', Math.min(x, start.p[0]));
-        rect.setAttribute('y', Math.min(y, start.p[1]));
-        rect.setAttribute('width', Math.abs(x - start.p[0]));
-        rect.setAttribute('height', Math.abs(y - start.p[1]));
+        if (start.mode === 'draw') {
+          const [x, y] = svgPoint(ev);
+          rect.setAttribute('x', Math.min(x, start.p[0]));
+          rect.setAttribute('y', Math.min(y, start.p[1]));
+          rect.setAttribute('width', Math.abs(x - start.p[0]));
+          rect.setAttribute('height', Math.abs(y - start.p[1]));
+        } else if (start.mode === 'move' || start.mode === 'resize') {
+          // Vorschau: Markierung samt Griffen mitziehen
+          start.shape.quad = this.rectToQuad(liveRect(ev));
+          start.moved = true;
+          this.drawShapes();
+        }
         return;
       }
       const dx = ev.clientX - start.x, dy = ev.clientY - start.y;
@@ -308,12 +406,17 @@ export class PageViewer {
       const s = start;
       start = null;
       if (this.markMode) {
-        rect?.remove();
-        if (cancelled) return;
-        const [x, y] = svgPoint(ev);
-        if (Math.abs(x - s.p[0]) < 3 || Math.abs(y - s.p[1]) < 3) return;
-        const corners = [[s.p[0], s.p[1]], [x, s.p[1]], [x, y], [s.p[0], y]].map(([vx, vy]) => this.vp1.convertToPdfPoint(vx, vy));
-        this.onDraw?.(this.index, corners);
+        if (s.mode === 'draw') {
+          rect?.remove();
+          if (cancelled) return;
+          const [x, y] = svgPoint(ev);
+          if (Math.abs(x - s.p[0]) < 3 || Math.abs(y - s.p[1]) < 3) { this.select(null); return; } // Tippen ins Leere = Auswahl aufheben
+          const corners = [[s.p[0], s.p[1]], [x, s.p[1]], [x, y], [s.p[0], y]].map(([vx, vy]) => this.vp1.convertToPdfPoint(vx, vy));
+          this.onDraw?.(this.index, corners);
+        } else if (s.moved && !cancelled) {
+          const r = liveRect(ev, s);
+          if (r.x1 - r.x0 >= 2 && r.y1 - r.y0 >= 2) this.onAreaChange?.(s.shape.id, this.rectToQuad(r));
+        }
         return;
       }
       this.stage.style.transition = 'transform 150ms';

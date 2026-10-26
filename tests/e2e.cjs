@@ -203,6 +203,49 @@ function rawText(buf) {
   await page.waitForTimeout(300);
   await page.screenshot({ path: path.join(OUT, 'e2e-5-bekannt.png') });
 
+  // Markieren: Bereich aufziehen, verschieben, Größe ändern, löschen, rückgängig
+  await page.evaluate(() => { document.getElementById('sheet').classList.remove('open'); document.getElementById('scrim').hidden = true; });
+  await page.click('#tabOriginal');
+  await page.waitForTimeout(300);
+  await page.click('#btnMark');
+  await page.waitForTimeout(200);
+  check(await page.isVisible('#markBar'), 'Markier-Leiste erscheint');
+  const vb = await page.locator('.pv-page svg').boundingBox();
+  const at = (fx, fy) => [vb.x + vb.width * fx, vb.y + vb.height * fy];
+  const drag = async ([x0, y0], [x1, y1]) => { await page.mouse.move(x0, y0); await page.mouse.down(); await page.mouse.move(x1, y1, { steps: 6 }); await page.mouse.up(); await page.waitForTimeout(150); };
+  const areas = () => page.evaluate(() => window.__pdfPrivacy.state.findings.filter((f) => f.cat === 'manual').map((f) => {
+    const q = f.occurrences[0].quads[0]; const xs = q.map((p) => p[0]), ys = q.map((p) => p[1]);
+    return { id: f.id, x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys) };
+  }));
+  const before = (await areas()).length;
+  await drag(at(0.55, 0.70), at(0.75, 0.78));
+  let a = await areas();
+  check(a.length === before + 1, 'Neuer Bereich aufgezogen');
+  const sel = await page.evaluate(() => window.__pdfPrivacy.viewer.selectedId);
+  check(sel === a[0].id && (await page.locator('circle.handle').count()) === 4, 'Neuer Bereich ist ausgewählt, 4 Griffe sichtbar');
+  const first = a[0];
+  await drag(at(0.65, 0.74), at(0.65, 0.64)); // innen nach oben ziehen
+  a = await areas();
+  check(a[0].y0 > first.y0 + 30 && Math.abs((a[0].x1 - a[0].x0) - (first.x1 - first.x0)) < 1, 'Bereich verschoben (Größe gleich)');
+  const moved = a[0];
+  const hb = await page.locator('circle.handle').nth(2).boundingBox(); // Ecke unten rechts
+  await drag([hb.x + hb.width / 2, hb.y + hb.height / 2], [hb.x + hb.width / 2 + 40, hb.y + hb.height / 2 + 30]);
+  a = await areas();
+  check(a[0].x1 > moved.x1 + 10 && a[0].y0 < moved.y0 - 5 && Math.abs(a[0].x0 - moved.x0) < 1, 'Ecke gezogen: Bereich größer');
+  await page.click('#mkDelete');
+  check((await areas()).length === before, 'Ausgewählten Bereich gelöscht');
+  await page.click('#mkUndo');
+  a = await areas();
+  check(a.length === before + 1, 'Rückgängig: Bereich wieder da');
+  await page.click('#mkUndo');
+  a = await areas();
+  check(Math.abs(a[0].x1 - moved.x1) < 1, 'Rückgängig: Größenänderung zurück');
+  await page.click('#mkUndo'); await page.click('#mkUndo');
+  check((await areas()).length === before, 'Rückgängig: auch das Aufziehen zurück');
+  await page.screenshot({ path: path.join(OUT, 'e2e-9-markieren.png') });
+  await page.click('#mkDone');
+  check(!(await page.isVisible('#markBar')), 'Fertig beendet den Markiermodus');
+
   // Bedienung auf dem iPhone: Leiste verdeckt nichts, Wischen klappt die Liste auf/zu, ✕ schließt das Dokument
   await page.evaluate(() => { const s = document.getElementById('sheet'); s.classList.remove('open'); document.getElementById('scrim').hidden = true; });
   await page.waitForTimeout(300);

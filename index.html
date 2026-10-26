@@ -37,6 +37,16 @@
       <button id="btnOpen2" class="btn primary big" type="button">PDF öffnen</button>
     </section>
     <div id="viewer" class="viewer" hidden></div>
+    <div class="markbar" id="markBar" hidden>
+      <div class="row">
+        <button id="mkUndo" class="tool" type="button" aria-label="Rückgängig" title="Rückgängig">↶</button>
+        <button id="mkDelete" class="tool" type="button" aria-label="Ausgewählten Bereich löschen" title="Löschen">🗑</button>
+        <button id="mkPrev" class="tool" type="button" aria-label="Vorherige Seite oder vorheriges Viertel">‹</button>
+        <button id="mkNext" class="tool" type="button" aria-label="Nächste Seite oder nächstes Viertel">›</button>
+        <button id="mkDone" class="btn primary small" type="button">Fertig</button>
+      </div>
+      <div class="markhint">Ziehen: neuer Bereich · Tippen: auswählen · Ecken: Größe</div>
+    </div>
   </main>
 
   <nav class="toolbar" id="toolbar" hidden>
@@ -123,6 +133,7 @@
           <option value="300">300 dpi – sehr scharf</option>
         </select>
       </label>
+      <label class="check"><input id="setOcr" type="checkbox"> Gescannte Seiten per Texterkennung lesen (auf dem Gerät, beim ersten Mal ca. 5 MB laden)</label>
       <label class="check"><input id="setRasterAll" type="checkbox"> Alle Seiten als Bild neu aufbauen (maximale Sicherheit)</label>
       <h3>Pseudonym-Tabelle</h3>
       <p class="small">Gespeichert nur auf diesem Gerät. Originalwerte werden nicht abgelegt, nur ein nicht umkehrbarer Fingerabdruck – daneben der Ersatzwert und ein gekürzter Hinweis.</p>

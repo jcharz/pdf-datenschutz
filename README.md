@@ -98,6 +98,36 @@ Die Erkennung ist bewusst großzügig: Lieber ein Fund zu viel in der Liste als 
   (SHA-256 mit geräteeigenem Zufallswert), der Ersatzwert und ein gekürzter Hinweis wie `DE…00`.
 - Unter ⚙︎ kannst du die Tabelle ansehen, einzelne Einträge löschen, sie als Datei **sichern** und **wiederherstellen**.
 
+## Gescannte Dokumente (Texterkennung)
+
+Besteht eine Seite nur aus einem Bild (Scan, Foto), liest die App sie per **Texterkennung (OCR)**, und zwar ebenfalls
+komplett auf dem Gerät mit [Tesseract.js](https://github.com/naptha/tesseract.js) und dem deutschen Sprachmodell.
+Danach funktioniert alles wie bei normalen PDFs: Erkennung, Adressblöcke, Absender/eigene Daten, Schwärzen,
+Ersetzen (der Ersatz wird passend in Größe und Farbe ins Bild gesetzt), Schablonen.
+
+- Die Bausteine (ca. 5 MB) liefert die App selbst aus (`vendor/tesseract`). Es wird nichts von fremden Servern
+  geladen. Nach dem ersten Mal liegen sie im Gerätespeicher. Übernommen aus dem Projekt *PKV Belege*: Tesseract.js 7,
+  Modell `deu` (best_int), `workerBlobURL: false` für die Content-Security-Policy, Seiten in ca. 2000 px Breite.
+- Neu gegenüber *PKV Belege*: Die App nutzt die **Lage jedes erkannten Worts** (Grundlinie, Höhe der Großbuchstaben,
+  Schräglage), damit Balken und Ersatztext genau sitzen. Bei Scans sind die Balken etwas großzügiger.
+- **Prüfung des Bildes:** Bei Scans liest die App das Ergebnis noch einmal per Texterkennung. Ist ein entfernter Wert
+  im Bild noch (teilweise) lesbar, meldet der Prüfbericht das mit Seite, und **„Rest entfernen“** schwärzt genau diese
+  Stelle nach. Zufällige Ähnlichkeiten (z. B. eine Telefonnummer mit denselben Ziffern) und Ersatzwerte werden
+  dabei nicht als Rest gezählt.
+- In der Liste steht bei jeder gescannten Seite ein Hinweis mit der Erkennungssicherheit. Bei schlechten Scans
+  bitte die Funde kurz prüfen und Fehlendes mit ▭ markieren.
+- Abschaltbar unter ⚙︎ („Gescannte Seiten per Texterkennung lesen“).
+
+## Bereiche von Hand markieren
+
+**▭** schaltet den Markiermodus ein. Unten links erscheint eine Leiste:
+
+- **Auf freier Fläche ziehen** legt einen neuen Bereich an. Er ist sofort ausgewählt (4 Griffe an den Ecken).
+- **Antippen** wählt einen Bereich aus, **innen ziehen** verschiebt ihn, eine **Ecke ziehen** ändert die Größe.
+- **🗑** löscht den ausgewählten Bereich, **↶** macht die letzten Schritte rückgängig (auch mehrfach).
+- **‹ ›** blättert (Wischen ist im Markiermodus aus), **Fertig** beendet den Modus.
+- Am Computer: Entf löscht, Strg/⌘+Z macht rückgängig.
+
 ## Bedienung auf dem iPhone
 
 - Unten sitzt eine **schmale Leiste**: links der Hauptknopf (*Anwenden* → *Speichern*), daneben die Zusammenfassung.
@@ -148,7 +178,7 @@ und „Ersetzen“ bestätigen. Am Computer (Chrome/Edge) wird die geöffnete Da
 npm start              # lokaler Server auf http://localhost:8080
 npm test               # Erkennung, Ersatzwerte, Tabelle (Node, keine Abhängigkeiten)
 npm run test:e2e       # kompletter Ablauf im Browser (Playwright + Chromium)
-npm run test:samples   # Auswertung an 11 Beispieldokumenten inkl. Schablonen-Ablauf
+npm run test:samples   # Auswertung an 16 Beispieldokumenten (inkl. 4 Scans) und Abläufen
 ```
 
 `tests/samples.cjs` erzeugt erfundene, aber realistische Dokumente: Krankenkassen-Abrechnung (zweimal, für den
@@ -168,15 +198,19 @@ mehr im Ergebnis-PDF steht.
 | `js/pseudo.js` | Ersatzwerte mit Prüfziffern, Pseudonym-Tabelle |
 | `js/pdfmodel.js` | Text, Zeichenpositionen und Bilder einer Seite |
 | `js/redact.js` | Schwärzen/Ersetzen und Prüfung des Ergebnisses |
-| `js/viewer.js` | Seitenansicht mit Wischen und Lupe |
+| `js/viewer.js` | Seitenansicht mit Wischen, Lupe und Bearbeiten markierter Bereiche |
+| `js/ocr.js` | Texterkennung für gescannte Seiten (Tesseract, lokal) |
 | `sw.js` | Offline-Fähigkeit |
 
 ## Grenzen
 
 - Die Erkennung arbeitet mit Regeln, Mustern, Prüfziffern, Namenslisten und dem Seitenlayout, nicht mit einer KI. Seltene Namen ohne
   Anrede oder Bezeichnung können durchrutschen. In dem Fall hilft ein Hinweis („den Namen …“).
-- Text in Bildern und eingescannten Seiten wird nicht gelesen. Dafür gibt es ▭.
+- Texterkennung ist nicht perfekt: Handschrift, sehr schlechte Scans oder ungewöhnliche Schriften können Werte
+  verfälschen oder übersehen. Darum bei Scans die Liste prüfen und notfalls mit ▭ ergänzen.
+- Text in Logos oder Fotos *innerhalb* eines Text-PDFs wird nicht gelesen (nur ganze Scan-Seiten).
 - Ersatztext wird in einer Standardschrift eingesetzt. Er passt sich Größe, Farbe und Breite an, sieht aber nicht immer exakt aus wie die Originalschrift.
 - Geänderte Seiten sind danach Bilder mit unsichtbarer Textebene. Die Datei wird etwas größer.
 
-Bibliotheken: [pdf.js](https://github.com/mozilla/pdf.js) (Apache-2.0) und [pdf-lib](https://github.com/Hopding/pdf-lib) (MIT). Die Lizenzen liegen in `vendor/`.
+Bibliotheken: [pdf.js](https://github.com/mozilla/pdf.js) (Apache-2.0), [pdf-lib](https://github.com/Hopding/pdf-lib) (MIT) und
+[Tesseract.js](https://github.com/naptha/tesseract.js) (Apache-2.0). Die Lizenzen liegen in `vendor/`.
